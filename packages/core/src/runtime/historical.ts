@@ -1032,7 +1032,7 @@ export async function* getLocalEventGenerator(params: {
 
   for await (const syncCursor of bufferAsyncGenerator(
     localSyncGenerator,
-    Number.POSITIVE_INFINITY,
+    10,
   )) {
     while (cursor <= Math.min(syncCursor, toBlock)) {
       const queryEndClock = startClock();
@@ -1356,10 +1356,17 @@ export async function* getLocalSyncGenerator(params: {
         target: params.common.options.command === "dev" ? 2_000 : 10_000,
         result: duration,
         min: 25,
-        max: 100_000,
+        max: 500_000,
         prev: estimateRange,
-        maxIncrease: 1.5,
+        maxIncrease: 2.0,
       });
+
+      const pressure = params.common.memoryMonitor.getPressure();
+      if (pressure === "critical") {
+        estimateRange = Math.max(25, Math.round(estimateRange * 0.5));
+      } else if (pressure === "elevated") {
+        estimateRange = Math.max(25, Math.round(estimateRange * 0.75));
+      }
 
       params.common.logger.trace({
         msg: "Updated block range estimate for fetching backfill JSON-RPC data",
@@ -1407,6 +1414,10 @@ export async function* getLocalSyncGenerator(params: {
       label,
       interval[1] - interval[0] + 1,
     );
+
+    params.common.stateManager.setChainProgress(params.chain.name, {
+      currentBlock: interval[1],
+    });
 
     return requiredIntervals.length > 0;
   }

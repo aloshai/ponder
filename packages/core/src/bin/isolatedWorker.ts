@@ -5,6 +5,8 @@ import type { Common } from "@/internal/common.js";
 import { createLogger } from "@/internal/logger.js";
 import { IsolatedMetricsService } from "@/internal/metrics.js";
 import { createShutdown } from "@/internal/shutdown.js";
+import { createStateManager } from "@/internal/state.js";
+import { createMemoryMonitor } from "@/internal/memory.js";
 import { createTelemetry } from "@/internal/telemetry.js";
 import type {
   CrashRecoveryCheckpoint,
@@ -63,6 +65,8 @@ export async function isolatedWorker({
     shutdown,
     buildShutdown: shutdown,
     apiShutdown: shutdown,
+    stateManager: createStateManager(),
+    memoryMonitor: createMemoryMonitor(logger),
   };
 
   let isKilled = false;

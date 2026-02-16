@@ -196,6 +196,20 @@ export async function runOmnichain({
     }),
   );
 
+  common.stateManager.initializeChains(indexingBuild.chains);
+  common.memoryMonitor.start();
+  for (const chain of indexingBuild.chains) {
+    const { syncProgress } = perChainSync.get(chain)!;
+    const startBlock = Number(syncProgress.start.number.replace("0x", ""), 16);
+    const targetBlock = syncProgress.end
+      ? Number(syncProgress.end.number.replace("0x", ""), 16)
+      : Number(syncProgress.finalized.number.replace("0x", ""), 16);
+    common.stateManager.setChainProgress(chain.name, {
+      currentBlock: startBlock,
+      targetBlock,
+    });
+  }
+
   const start = Number(
     decodeCheckpoint(getOmnichainCheckpoint({ perChainSync, tag: "start" }))
       .blockTimestamp,
@@ -616,6 +630,10 @@ export async function runOmnichain({
     msg: "Started returning 200 responses",
     endpoint: "/ready",
   });
+
+  for (const chain of indexingBuild.chains) {
+    common.stateManager.setChainPhase(chain.name, "realtime");
+  }
 
   const bufferCallback = (bufferSize: number) => {
     // Note: Only log when the buffer size is greater than 1 because

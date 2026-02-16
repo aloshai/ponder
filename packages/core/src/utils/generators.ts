@@ -126,26 +126,41 @@ export async function* recordAsyncGenerator<T>(
 
 /**
  * Creates an async generator that yields values from a callback.
+ * Supports optional bounded buffering via `maxSize` — when the buffer
+ * reaches `maxSize`, `callback` returns a promise that resolves once
+ * the consumer drains an item (backpressure).
  */
 export function createCallbackGenerator<T>(
   bufferCallback?: (bufferSize: number) => void,
+  maxSize?: number,
 ): {
-  callback: (value: T) => void;
+  callback: (value: T) => Promise<void> | void;
   generator: AsyncGenerator<T, void, unknown>;
 } {
   const buffer: T[] = [];
   let pwr = promiseWithResolvers<void>();
+  let drainPwr: ReturnType<typeof promiseWithResolvers<void>> | undefined;
 
-  const callback = (value: T) => {
+  const callback = (value: T): Promise<void> | void => {
     buffer.push(value);
     bufferCallback?.(buffer.length);
     pwr.resolve();
+
+    if (maxSize !== undefined && buffer.length >= maxSize) {
+      drainPwr = promiseWithResolvers<void>();
+      return drainPwr.promise;
+    }
   };
 
   async function* generator() {
     while (true) {
       if (buffer.length > 0) {
         yield buffer.shift()!;
+
+        if (drainPwr && buffer.length < (maxSize ?? Infinity)) {
+          drainPwr.resolve();
+          drainPwr = undefined;
+        }
       } else {
         await pwr.promise;
         pwr = promiseWithResolvers<void>();

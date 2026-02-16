@@ -68,6 +68,17 @@ globalThis.DISABLE_EVENT_PROXY = false;
 const EVENT_LOOP_UPDATE_INTERVAL = 25;
 const METRICS_UPDATE_INTERVAL = 100;
 
+export type IndexingState = {
+  phase: "backfilling" | "realtime" | "complete";
+  progress: Record<string, {
+    phase: "backfilling" | "realtime" | "complete";
+    progress: number;
+    currentBlock: number;
+    targetBlock: number;
+    eta: number | undefined;
+  }>;
+};
+
 export type Context = {
   chain: { id: number; name: string };
   client: ReadonlyClient;
@@ -81,6 +92,7 @@ export type Context = {
       endBlock?: number;
     }
   >;
+  state: IndexingState;
 };
 
 export type Indexing = {
@@ -166,6 +178,21 @@ export const createIndexing = ({
   columnAccessPattern: ColumnAccessPattern;
   eventCount: { [eventName: string]: number };
 }): Indexing => {
+  const buildStateSnapshot = (): IndexingState => {
+    const globalState = common.stateManager.getState();
+    const progress: IndexingState["progress"] = {};
+    for (const [name, chain] of Object.entries(globalState.chains)) {
+      progress[name] = {
+        phase: chain.phase,
+        progress: chain.progress,
+        currentBlock: chain.currentBlock,
+        targetBlock: chain.targetBlock,
+        eta: chain.eta,
+      };
+    }
+    return { phase: globalState.phase, progress };
+  };
+
   const indexingFunctionArg = {
     event: undefined as Event | SetupEvent | undefined,
     context: {
@@ -173,6 +200,7 @@ export const createIndexing = ({
       contracts: undefined!,
       client: undefined!,
       db: indexingStore.db,
+      state: buildStateSnapshot(),
     } as Context,
   };
 
@@ -276,6 +304,8 @@ export const createIndexing = ({
 
         lastChainId = event.chain.id;
       }
+
+      indexingFunctionArg.context.state = buildStateSnapshot();
       // @ts-ignore
       indexingFunctionArg.event = event.event;
 

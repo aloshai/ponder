@@ -159,6 +159,15 @@ export async function runIsolated({
     "type"
   >[] = [];
 
+  common.stateManager.initializeChains([chain]);
+  common.memoryMonitor.start();
+  common.stateManager.setChainProgress(chain.name, {
+    currentBlock: Number(syncProgress.start.number.replace("0x", ""), 16),
+    targetBlock: syncProgress.end
+      ? Number(syncProgress.end.number.replace("0x", ""), 16)
+      : Number(syncProgress.finalized.number.replace("0x", ""), 16),
+  });
+
   const start = Number(
     decodeCheckpoint(syncProgress.getCheckpoint({ tag: "start" }))
       .blockTimestamp,
@@ -511,6 +520,8 @@ export async function runIsolated({
   });
 
   onReady();
+
+  common.stateManager.setChainPhase(chain.name, "realtime");
 
   const bufferCallback = (bufferSize: number) => {
     // Note: Only log when the buffer size is greater than 1 because

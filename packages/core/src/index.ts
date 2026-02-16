@@ -7,6 +7,16 @@ export type {
   TransactionReceipt,
 } from "@/types/eth.js";
 export type { Virtual } from "@/types/virtual.js";
+export type { IndexingState } from "@/indexing/index.js";
+export type {
+  IndexingPhase,
+  ChainState,
+  GlobalState,
+} from "@/internal/state.js";
+export type {
+  MemoryPressure,
+  MemorySnapshot,
+} from "@/internal/memory.js";
 export {
   type MergeAbis,
   type ReplaceBigInts,

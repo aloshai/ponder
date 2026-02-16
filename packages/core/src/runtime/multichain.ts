@@ -156,6 +156,9 @@ export async function runMultichain({
   >();
   const seconds: Seconds = {};
 
+  common.stateManager.initializeChains(indexingBuild.chains);
+  common.memoryMonitor.start();
+
   await Promise.all(
     indexingBuild.chains.map(async (chain) => {
       const eventCallbacks =
@@ -189,6 +192,13 @@ export async function runMultichain({
         childAddresses,
         cachedIntervals,
         unfinalizedBlocks,
+      });
+
+      common.stateManager.setChainProgress(chain.name, {
+        currentBlock: Number(syncProgress.start.number.replace("0x", ""), 16),
+        targetBlock: syncProgress.end
+          ? Number(syncProgress.end.number.replace("0x", ""), 16)
+          : Number(syncProgress.finalized.number.replace("0x", ""), 16),
       });
 
       const _crashRecoveryCheckpoint = crashRecoveryCheckpoint?.find(
@@ -601,6 +611,10 @@ export async function runMultichain({
     msg: "Started returning 200 responses",
     endpoint: "/ready",
   });
+
+  for (const chain of indexingBuild.chains) {
+    common.stateManager.setChainPhase(chain.name, "realtime");
+  }
 
   const bufferCallback = (bufferSize: number) => {
     // Note: Only log when the buffer size is greater than 1 because

@@ -12,6 +12,7 @@ import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { createMiddleware } from "hono/factory";
+import { streamSSE } from "hono/streaming";
 import { createHttpTerminator } from "http-terminator";
 import { onError } from "./error.js";
 
@@ -72,8 +73,24 @@ export async function createServer({
     }
   });
 
+  const stateHeadersMiddleware = createMiddleware(async (c, next) => {
+    await next();
+
+    const globalState = common.stateManager.getState();
+    c.header("X-Ponder-State", globalState.phase);
+
+    const chains = Object.values(globalState.chains);
+    if (chains.length > 0) {
+      const maxBlock = Math.max(...chains.map((ch) => ch.currentBlock));
+      c.header("X-Ponder-Block", String(maxBlock));
+    }
+
+    c.header("X-Ponder-Timestamp", String(Math.floor(Date.now() / 1000)));
+  });
+
   const hono = new Hono()
     .use(metricsMiddleware)
+    .use(stateHeadersMiddleware)
     .use(cors({ origin: "*", maxAge: 86400 }))
     .get("/metrics", async (c) => {
       try {
@@ -87,6 +104,22 @@ export async function createServer({
       return c.text("", 200);
     })
     .get("/ready", async (c) => {
+      const chainParam = c.req.query("chain");
+
+      if (chainParam) {
+        const chainState = common.stateManager.getChainState(chainParam);
+        if (!chainState) {
+          return c.text(`Unknown chain: ${chainParam}`, 404);
+        }
+        if (chainState.phase !== "backfilling") {
+          return c.text("", 200);
+        }
+        return c.text(
+          `Historical indexing is not complete for chain "${chainParam}".`,
+          503,
+        );
+      }
+
       const isReady = await database.readonlyQB.wrap(
         { label: "select_ready" },
         (db) =>
@@ -102,14 +135,18 @@ export async function createServer({
       return c.text("Historical indexing is not complete.", 503);
     })
     .get("/status", async (c) => {
+      const globalState = common.stateManager.getState();
+
       const checkpoints = await database.readonlyQB.wrap(
         { label: "select_checkpoints" },
         (db) => db.select().from(getPonderCheckpointTable()),
       );
+
       const status: Status = {};
       for (const { chainName, chainId, latestCheckpoint } of checkpoints.sort(
         (a, b) => (a.chainId > b.chainId ? 1 : -1),
       )) {
+        const chainState = globalState.chains[chainName];
         status[chainName] = {
           id: chainId,
           block: {
@@ -118,9 +155,46 @@ export async function createServer({
               decodeCheckpoint(latestCheckpoint).blockTimestamp,
             ),
           },
+          state: chainState?.phase ?? "backfilling",
+          progress: chainState?.progress ?? 0,
+          eta: chainState?.eta ?? null,
         };
       }
-      return c.json(status);
+
+      return c.json({
+        state: globalState.phase,
+        chains: status,
+        memory: common.memoryMonitor.getSnapshot(),
+      });
+    })
+    .get("/status/stream", (c) => {
+      return streamSSE(c, async (stream) => {
+        const globalState = common.stateManager.getState();
+        await stream.writeSSE({
+          data: JSON.stringify(globalState),
+          event: "state",
+        });
+
+        const unsubscribe = common.stateManager.subscribe(async (state) => {
+          try {
+            await stream.writeSSE({
+              data: JSON.stringify(state),
+              event: "state",
+            });
+          } catch {
+            unsubscribe();
+          }
+        });
+
+        stream.onAbort(() => {
+          unsubscribe();
+        });
+
+        await new Promise<void>((resolve) => {
+          common.shutdown.add(resolve);
+          common.apiShutdown.add(resolve);
+        });
+      });
     })
     .route("/", apiBuild.app)
     .onError((error, c) => onError(error, c, common));

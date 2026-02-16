@@ -8,6 +8,8 @@ import { createLogger } from "@/internal/logger.js";
 import { MetricsService } from "@/internal/metrics.js";
 import { buildOptions } from "@/internal/options.js";
 import { createShutdown } from "@/internal/shutdown.js";
+import { createStateManager } from "@/internal/state.js";
+import { createMemoryMonitor } from "@/internal/memory.js";
 import { buildPayload, createTelemetry } from "@/internal/telemetry.js";
 import type {
   CrashRecoveryCheckpoint,
@@ -59,6 +61,8 @@ export async function dev({ cliOptions }: { cliOptions: CliOptions }) {
     shutdown: createShutdown(),
     apiShutdown: createShutdown(),
     buildShutdown: createShutdown(),
+    stateManager: createStateManager(),
+    memoryMonitor: createMemoryMonitor(logger),
   } as Common;
 
   const telemetry = createTelemetry(common);

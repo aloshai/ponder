@@ -112,8 +112,11 @@ export const createHistoricalSync = (
     estimatedRange: number;
     /** Range suggested by an error message */
     confirmedRange?: number;
+    /** Track consecutive successes for step-function growth */
+    successCount: number;
   } = {
-    estimatedRange: 500,
+    estimatedRange: 2_000,
+    successCount: 0,
   };
 
   ////////
@@ -241,6 +244,7 @@ export const createHistoricalSync = (
               confirmedRange: getLogsErrorResponse.isSuggestedRange
                 ? range
                 : undefined,
+              successCount: 0,
             };
 
             return syncLogsDynamic(
@@ -266,8 +270,17 @@ export const createHistoricalSync = (
      */
 
     if (logsRequestMetadata.confirmedRange === undefined) {
+      logsRequestMetadata.successCount++;
+
+      const multiplier =
+        logsRequestMetadata.successCount <= 3
+          ? 2
+          : logsRequestMetadata.successCount <= 8
+            ? 1.5
+            : 1.1;
+
       logsRequestMetadata.estimatedRange = Math.round(
-        logsRequestMetadata.estimatedRange * 1.05,
+        logsRequestMetadata.estimatedRange * multiplier,
       );
     }
 

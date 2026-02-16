@@ -1,7 +1,9 @@
 import type { Logger } from "./logger.js";
+import type { MemoryMonitor } from "./memory.js";
 import type { MetricsService } from "./metrics.js";
 import type { Options } from "./options.js";
 import type { Shutdown } from "./shutdown.js";
+import type { StateManager } from "./state.js";
 import type { Telemetry } from "./telemetry.js";
 
 export type Common = {
@@ -12,4 +14,6 @@ export type Common = {
   shutdown: Shutdown;
   apiShutdown: Shutdown;
   buildShutdown: Shutdown;
+  stateManager: StateManager;
+  memoryMonitor: MemoryMonitor;
 };
