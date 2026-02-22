@@ -1,0 +1,51 @@
+name: Build & Release Branch
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm build
+
+      - name: Resolve workspace dependencies
+        run: |
+          UTILS_VERSION=$(node -p "require('./packages/utils/package.json').version")
+
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('packages/core/package.json', 'utf8'));
+            if (pkg.dependencies?.['@ponder/utils']?.startsWith('workspace:')) {
+              pkg.dependencies['@ponder/utils'] = '${UTILS_VERSION}';
+            }
+            fs.writeFileSync('packages/core/package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+      - name: Push to release branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B release
+          git add -f packages/core/dist packages/utils/dist packages/client/dist
+          git add packages/core/package.json
+          git commit -m "build: release $(date -u +%Y%m%d-%H%M%S) from ${GITHUB_SHA::8}"
+          git push origin release --force
