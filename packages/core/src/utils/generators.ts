@@ -157,7 +157,7 @@ export function createCallbackGenerator<T>(
       if (buffer.length > 0) {
         yield buffer.shift()!;
 
-        if (drainPwr && buffer.length < (maxSize ?? Infinity)) {
+        if (drainPwr && buffer.length < (maxSize ?? Number.POSITIVE_INFINITY)) {
           drainPwr.resolve();
           drainPwr = undefined;
         }

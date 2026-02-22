@@ -70,13 +70,16 @@ const METRICS_UPDATE_INTERVAL = 100;
 
 export type IndexingState = {
   phase: "backfilling" | "realtime" | "complete";
-  progress: Record<string, {
-    phase: "backfilling" | "realtime" | "complete";
-    progress: number;
-    currentBlock: number;
-    targetBlock: number;
-    eta: number | undefined;
-  }>;
+  progress: Record<
+    string,
+    {
+      phase: "backfilling" | "realtime" | "complete";
+      progress: number;
+      currentBlock: number;
+      targetBlock: number;
+      eta: number | undefined;
+    }
+  >;
 };
 
 export type Context = {

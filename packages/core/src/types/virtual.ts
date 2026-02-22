@@ -222,13 +222,16 @@ export namespace Virtual {
     db: Db<schema>;
     state: {
       phase: "backfilling" | "realtime" | "complete";
-      progress: Record<string, {
-        phase: "backfilling" | "realtime" | "complete";
-        progress: number;
-        currentBlock: number;
-        targetBlock: number;
-        eta: number | undefined;
-      }>;
+      progress: Record<
+        string,
+        {
+          phase: "backfilling" | "realtime" | "complete";
+          progress: number;
+          currentBlock: number;
+          targetBlock: number;
+          eta: number | undefined;
+        }
+      >;
     };
   };
 

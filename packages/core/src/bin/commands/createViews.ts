@@ -21,11 +21,11 @@ import {
 } from "@/drizzle/onchain.js";
 import { sql } from "@/index.js";
 import { createLogger } from "@/internal/logger.js";
+import { createMemoryMonitor } from "@/internal/memory.js";
 import { MetricsService } from "@/internal/metrics.js";
 import { buildOptions } from "@/internal/options.js";
 import { createShutdown } from "@/internal/shutdown.js";
 import { createStateManager } from "@/internal/state.js";
-import { createMemoryMonitor } from "@/internal/memory.js";
 import { createTelemetry } from "@/internal/telemetry.js";
 import { startClock } from "@/utils/timer.js";
 import { eq } from "drizzle-orm";

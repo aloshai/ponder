@@ -21,7 +21,9 @@ export type MemoryMonitorOptions = {
 export type MemoryMonitor = {
   getSnapshot: () => MemorySnapshot;
   getPressure: () => MemoryPressure;
-  onPressureChange: (listener: (pressure: MemoryPressure) => void) => () => void;
+  onPressureChange: (
+    listener: (pressure: MemoryPressure) => void,
+  ) => () => void;
   start: () => void;
   stop: () => void;
 };

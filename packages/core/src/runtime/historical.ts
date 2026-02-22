@@ -1030,10 +1030,7 @@ export async function* getLocalEventGenerator(params: {
 
   const localSyncGenerator = getLocalSyncGenerator(params);
 
-  for await (const syncCursor of bufferAsyncGenerator(
-    localSyncGenerator,
-    10,
-  )) {
+  for await (const syncCursor of bufferAsyncGenerator(localSyncGenerator, 10)) {
     while (cursor <= Math.min(syncCursor, toBlock)) {
       const queryEndClock = startClock();
 

@@ -3,10 +3,10 @@ import { createBuild } from "@/build/index.js";
 import { createDatabase } from "@/database/index.js";
 import type { Common } from "@/internal/common.js";
 import { createLogger } from "@/internal/logger.js";
+import { createMemoryMonitor } from "@/internal/memory.js";
 import { IsolatedMetricsService } from "@/internal/metrics.js";
 import { createShutdown } from "@/internal/shutdown.js";
 import { createStateManager } from "@/internal/state.js";
-import { createMemoryMonitor } from "@/internal/memory.js";
 import { createTelemetry } from "@/internal/telemetry.js";
 import type {
   CrashRecoveryCheckpoint,

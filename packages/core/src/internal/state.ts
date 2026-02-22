@@ -55,7 +55,8 @@ export const createStateManager = (): StateManager => {
     const chainStates = Object.values(state.chains);
     if (chainStates.length === 0) return "backfilling";
     if (chainStates.every((c) => c.phase === "complete")) return "complete";
-    if (chainStates.some((c) => c.phase === "backfilling")) return "backfilling";
+    if (chainStates.some((c) => c.phase === "backfilling"))
+      return "backfilling";
     return "realtime";
   };
 
@@ -123,8 +124,10 @@ export const createStateManager = (): StateManager => {
     const chain = state.chains[chainName];
     if (!chain) return;
 
-    if (update.currentBlock !== undefined) chain.currentBlock = update.currentBlock;
-    if (update.targetBlock !== undefined) chain.targetBlock = update.targetBlock;
+    if (update.currentBlock !== undefined)
+      chain.currentBlock = update.currentBlock;
+    if (update.targetBlock !== undefined)
+      chain.targetBlock = update.targetBlock;
     if (update.eta !== undefined) chain.eta = update.eta;
 
     chain.progress = computeProgress(chain);
