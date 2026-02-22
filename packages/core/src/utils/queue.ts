@@ -1,3 +1,4 @@
+import { Deque } from "./deque.js";
 import {
   type PromiseWithResolvers,
   promiseWithResolvers,
@@ -83,7 +84,7 @@ export const createQueue = <returnType, taskType = void>({
     CreateQueueParameters<unknown, unknown>,
     "frequency" | "concurrency"
   > = _parameters;
-  let queue = new Array<InnerQueue<returnType, taskType>[number]>();
+  let queue = new Deque<InnerQueue<returnType, taskType>[number]>();
   let pending = 0;
   let timestamp = 0;
   let requests = 0;
@@ -119,7 +120,8 @@ export const createQueue = <returnType, taskType = void>({
         : true) &&
       queue.length > 0
     ) {
-      const { task, resolve, reject } = queue.shift()!;
+      const entry = queue.shift()!;
+      const { task, resolve, reject } = entry;
 
       requests++;
       pending++;
@@ -191,7 +193,7 @@ export const createQueue = <returnType, taskType = void>({
         }
       }
 
-      queue = new Array<InnerQueue<returnType, taskType>[number]>();
+      queue = new Deque<InnerQueue<returnType, taskType>[number]>();
       clearTimeout(timer);
       timer = undefined;
     },

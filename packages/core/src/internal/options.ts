@@ -39,6 +39,8 @@ export type Options = {
 
   rpcMaxConcurrency: number;
 
+  addressBatchSize: number;
+
   syncEventsQuerySize: number;
 };
 
@@ -113,6 +115,11 @@ export const buildOptions = ({ cliOptions }: { cliOptions: CliOptions }) => {
     factoryAddressCountThreshold: 1_000,
 
     rpcMaxConcurrency: 256,
+
+    addressBatchSize:
+      process.env.PONDER_ADDRESS_BATCH_SIZE !== undefined
+        ? Number(process.env.PONDER_ADDRESS_BATCH_SIZE)
+        : 50,
 
     // v8.getHeapStatistics().heap_size_limit / 5, rounded up to the nearest 64 MB
     indexingCacheMaxBytes:

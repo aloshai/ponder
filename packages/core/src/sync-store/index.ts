@@ -1,4 +1,10 @@
 import crypto from "node:crypto";
+import {
+  executeCopy,
+  getCopyText,
+  getQualifiedTableName,
+  getQuotedColumnList,
+} from "@/database/copy.js";
 import type { QB } from "@/database/queryBuilder.js";
 import { extractBlockNumberParam } from "@/indexing/client.js";
 import type { Common } from "@/internal/common.js";
@@ -55,10 +61,12 @@ import { orderObject } from "@/utils/order.js";
 import { startClock } from "@/utils/timer.js";
 import {
   type SQL,
+  type Table,
   and,
   asc,
   desc,
   eq,
+  getTableName,
   gte,
   inArray,
   isNull,
@@ -81,6 +89,14 @@ import {
   encodeTransactionReceipt,
 } from "./encode.js";
 import * as PONDER_SYNC from "./schema.js";
+
+const ENCODE_COLUMN_COUNTS: Record<string, number> = {
+  log: 0,
+  block: 0,
+  transaction: 0,
+  transactionReceipt: 0,
+  trace: 0,
+};
 
 export type SyncStore = {
   insertIntervals(
@@ -204,6 +220,58 @@ export const createSyncStore = ({
   common,
   qb,
 }: { common: Common; qb: QB<typeof PONDER_SYNC> }): SyncStore => {
+  const COPY_THRESHOLD = 50;
+
+  const copySyncInsert = async (
+    table: Table,
+    rows: Record<string, unknown>[],
+    conflictColumns: string[],
+    label: string,
+    context?: { logger?: Logger },
+  ) => {
+    const text = getCopyText(table, rows);
+    const qualifiedName = getQualifiedTableName(table);
+    const columnList = getQuotedColumnList(table);
+    const tempName = `_copy_${getTableName(table)}`;
+    const conflictClause = conflictColumns.map((c) => `"${c}"`).join(", ");
+
+    await qb.transaction(
+      { label },
+      async (tx) => {
+        await tx.wrap(
+          (db) =>
+            db.execute(
+              sql.raw(
+                `CREATE TEMP TABLE IF NOT EXISTS "${tempName}" (LIKE ${qualifiedName} INCLUDING DEFAULTS)`,
+              ),
+            ),
+          context,
+        );
+        await executeCopy(
+          tx.$dialect,
+          tx.$client,
+          `"${tempName}" (${columnList})`,
+          text,
+        );
+        await tx.wrap(
+          (db) =>
+            db.execute(
+              sql.raw(
+                `INSERT INTO ${qualifiedName} SELECT * FROM "${tempName}" ON CONFLICT (${conflictClause}) DO NOTHING`,
+              ),
+            ),
+          context,
+        );
+        await tx.wrap(
+          (db) => db.execute(sql.raw(`TRUNCATE "${tempName}"`)),
+          context,
+        );
+      },
+      undefined,
+      context,
+    );
+  };
+
   const syncStore = {
     insertIntervals: async (
       { intervals, factoryIntervals, chainId },
@@ -571,30 +639,33 @@ export const createSyncStore = ({
     insertLogs: async ({ logs, chainId }, context) => {
       if (logs.length === 0) return;
 
-      // Calculate `batchSize` based on how many parameters the
-      // input will have
+      const encoded = logs.map((log) => encodeLog({ log, chainId }));
+
+      if (encoded.length > COPY_THRESHOLD) {
+        await copySyncInsert(
+          PONDER_SYNC.logs,
+          encoded,
+          ["chain_id", "block_number", "log_index"],
+          "insert_logs_copy",
+          context,
+        );
+        return;
+      }
+
+      if (ENCODE_COLUMN_COUNTS.log === 0) {
+        ENCODE_COLUMN_COUNTS.log = Object.keys(encoded[0]!).length;
+      }
       const batchSize = Math.floor(
-        common.options.databaseMaxQueryParameters /
-          Object.keys(encodeLog({ log: logs[0]!, chainId })).length,
+        common.options.databaseMaxQueryParameters / ENCODE_COLUMN_COUNTS.log!,
       );
 
-      // As an optimization, logs that are matched by a factory do
-      // not contain a checkpoint, because not corresponding block is
-      // fetched (no block.timestamp). However, when a log is matched by
-      // both a log filter and a factory, the checkpoint must be included
-      // in the db.
-
-      for (let i = 0; i < logs.length; i += batchSize) {
+      for (let i = 0; i < encoded.length; i += batchSize) {
         await qb.wrap(
           { label: "insert_logs" },
           (db) =>
             db
               .insert(PONDER_SYNC.logs)
-              .values(
-                logs
-                  .slice(i, i + batchSize)
-                  .map((log) => encodeLog({ log, chainId })),
-              )
+              .values(encoded.slice(i, i + batchSize))
               .onConflictDoNothing({
                 target: [
                   PONDER_SYNC.logs.chainId,
@@ -609,24 +680,33 @@ export const createSyncStore = ({
     insertBlocks: async ({ blocks, chainId }, context) => {
       if (blocks.length === 0) return;
 
-      // Calculate `batchSize` based on how many parameters the
-      // input will have
+      const encoded = blocks.map((block) => encodeBlock({ block, chainId }));
+
+      if (encoded.length > COPY_THRESHOLD) {
+        await copySyncInsert(
+          PONDER_SYNC.blocks,
+          encoded,
+          ["chain_id", "number"],
+          "insert_blocks_copy",
+          context,
+        );
+        return;
+      }
+
+      if (ENCODE_COLUMN_COUNTS.block === 0) {
+        ENCODE_COLUMN_COUNTS.block = Object.keys(encoded[0]!).length;
+      }
       const batchSize = Math.floor(
-        common.options.databaseMaxQueryParameters /
-          Object.keys(encodeBlock({ block: blocks[0]!, chainId })).length,
+        common.options.databaseMaxQueryParameters / ENCODE_COLUMN_COUNTS.block!,
       );
 
-      for (let i = 0; i < blocks.length; i += batchSize) {
+      for (let i = 0; i < encoded.length; i += batchSize) {
         await qb.wrap(
           { label: "insert_blocks" },
           (db) =>
             db
               .insert(PONDER_SYNC.blocks)
-              .values(
-                blocks
-                  .slice(i, i + batchSize)
-                  .map((block) => encodeBlock({ block, chainId })),
-              )
+              .values(encoded.slice(i, i + batchSize))
               .onConflictDoNothing({
                 target: [PONDER_SYNC.blocks.chainId, PONDER_SYNC.blocks.number],
               }),
@@ -637,31 +717,36 @@ export const createSyncStore = ({
     insertTransactions: async ({ transactions, chainId }, context) => {
       if (transactions.length === 0) return;
 
-      // Calculate `batchSize` based on how many parameters the
-      // input will have
-      const batchSize = Math.floor(
-        common.options.databaseMaxQueryParameters /
-          Object.keys(
-            encodeTransaction({
-              transaction: transactions[0]!,
-              chainId,
-            }),
-          ).length,
+      const encoded = transactions.map((transaction) =>
+        encodeTransaction({ transaction, chainId }),
       );
 
-      for (let i = 0; i < transactions.length; i += batchSize) {
+      if (encoded.length > COPY_THRESHOLD) {
+        await copySyncInsert(
+          PONDER_SYNC.transactions,
+          encoded,
+          ["chain_id", "block_number", "transaction_index"],
+          "insert_transactions_copy",
+          context,
+        );
+        return;
+      }
+
+      if (ENCODE_COLUMN_COUNTS.transaction === 0) {
+        ENCODE_COLUMN_COUNTS.transaction = Object.keys(encoded[0]!).length;
+      }
+      const batchSize = Math.floor(
+        common.options.databaseMaxQueryParameters /
+          ENCODE_COLUMN_COUNTS.transaction!,
+      );
+
+      for (let i = 0; i < encoded.length; i += batchSize) {
         await qb.wrap(
           { label: "insert_transactions" },
           (db) =>
             db
               .insert(PONDER_SYNC.transactions)
-              .values(
-                transactions
-                  .slice(i, i + batchSize)
-                  .map((transaction) =>
-                    encodeTransaction({ transaction, chainId }),
-                  ),
-              )
+              .values(encoded.slice(i, i + batchSize))
               .onConflictDoNothing({
                 target: [
                   PONDER_SYNC.transactions.chainId,
@@ -679,34 +764,38 @@ export const createSyncStore = ({
     ) => {
       if (transactionReceipts.length === 0) return;
 
-      // Calculate `batchSize` based on how many parameters the
-      // input will have
-      const batchSize = Math.floor(
-        common.options.databaseMaxQueryParameters /
-          Object.keys(
-            encodeTransactionReceipt({
-              transactionReceipt: transactionReceipts[0]!,
-              chainId,
-            }),
-          ).length,
+      const encoded = transactionReceipts.map((transactionReceipt) =>
+        encodeTransactionReceipt({ transactionReceipt, chainId }),
       );
 
-      for (let i = 0; i < transactionReceipts.length; i += batchSize) {
+      if (encoded.length > COPY_THRESHOLD) {
+        await copySyncInsert(
+          PONDER_SYNC.transactionReceipts,
+          encoded,
+          ["chain_id", "block_number", "transaction_index"],
+          "insert_transaction_receipts_copy",
+          context,
+        );
+        return;
+      }
+
+      if (ENCODE_COLUMN_COUNTS.transactionReceipt === 0) {
+        ENCODE_COLUMN_COUNTS.transactionReceipt = Object.keys(
+          encoded[0]!,
+        ).length;
+      }
+      const batchSize = Math.floor(
+        common.options.databaseMaxQueryParameters /
+          ENCODE_COLUMN_COUNTS.transactionReceipt!,
+      );
+
+      for (let i = 0; i < encoded.length; i += batchSize) {
         await qb.wrap(
           { label: "insert_transaction_receipts" },
           (db) =>
             db
               .insert(PONDER_SYNC.transactionReceipts)
-              .values(
-                transactionReceipts
-                  .slice(i, i + batchSize)
-                  .map((transactionReceipt) =>
-                    encodeTransactionReceipt({
-                      transactionReceipt,
-                      chainId,
-                    }),
-                  ),
-              )
+              .values(encoded.slice(i, i + batchSize))
               .onConflictDoNothing({
                 target: [
                   PONDER_SYNC.transactionReceipts.chainId,
@@ -721,33 +810,35 @@ export const createSyncStore = ({
     insertTraces: async ({ traces, chainId }, context) => {
       if (traces.length === 0) return;
 
-      // Calculate `batchSize` based on how many parameters the
-      // input will have
-      const batchSize = Math.floor(
-        common.options.databaseMaxQueryParameters /
-          Object.keys(
-            encodeTrace({
-              trace: traces[0]!.trace,
-              block: traces[0]!.block,
-              transaction: traces[0]!.transaction,
-              chainId,
-            }),
-          ).length,
+      const encoded = traces.map(({ trace, block, transaction }) =>
+        encodeTrace({ trace, block, transaction, chainId }),
       );
 
-      for (let i = 0; i < traces.length; i += batchSize) {
+      if (encoded.length > COPY_THRESHOLD) {
+        await copySyncInsert(
+          PONDER_SYNC.traces,
+          encoded,
+          ["chain_id", "block_number", "transaction_index", "trace_index"],
+          "insert_traces_copy",
+          context,
+        );
+        return;
+      }
+
+      if (ENCODE_COLUMN_COUNTS.trace === 0) {
+        ENCODE_COLUMN_COUNTS.trace = Object.keys(encoded[0]!).length;
+      }
+      const batchSize = Math.floor(
+        common.options.databaseMaxQueryParameters / ENCODE_COLUMN_COUNTS.trace!,
+      );
+
+      for (let i = 0; i < encoded.length; i += batchSize) {
         await qb.wrap(
           { label: "insert_traces" },
           (db) =>
             db
               .insert(PONDER_SYNC.traces)
-              .values(
-                traces
-                  .slice(i, i + batchSize)
-                  .map(({ trace, block, transaction }) =>
-                    encodeTrace({ trace, block, transaction, chainId }),
-                  ),
-              )
+              .values(encoded.slice(i, i + batchSize))
               .onConflictDoNothing({
                 target: [
                   PONDER_SYNC.traces.chainId,

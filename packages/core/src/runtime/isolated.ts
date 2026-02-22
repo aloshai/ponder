@@ -316,9 +316,12 @@ export async function runIsolated({
     let endClock = startClock();
     await database.userQB.transaction(
       async (tx) => {
-        const initialCompletedEvents = structuredClone(
-          await common.metrics.ponder_indexing_completed_events.get(),
-        );
+        const metricsSnapshot =
+          await common.metrics.ponder_indexing_completed_events.get();
+        const initialCompletedEvents = metricsSnapshot.values.map((v) => ({
+          labels: { ...v.labels },
+          value: v.value,
+        }));
 
         try {
           indexingStore.qb = tx;
@@ -407,7 +410,7 @@ export async function runIsolated({
         } catch (error) {
           // Note: This can cause a bug with "dev" command, because there are multiple instances
           // updating the same metric.
-          for (const value of initialCompletedEvents.values) {
+          for (const value of initialCompletedEvents) {
             common.metrics.ponder_indexing_completed_events.set(
               value.labels,
               value.value,

@@ -1,4 +1,5 @@
 import { promiseWithResolvers } from "@/utils/promiseWithResolvers.js";
+import { Deque } from "./deque.js";
 import { startClock } from "./timer.js";
 
 /**
@@ -10,28 +11,28 @@ import { startClock } from "./timer.js";
 export async function* mergeAsyncGenerators<T>(
   generators: AsyncGenerator<T>[],
 ): AsyncGenerator<T> {
-  const promises = generators.map((gen) => gen.next());
+  let count = generators.length;
+  const promises: (Promise<{
+    index: number;
+    result: IteratorResult<T>;
+  }> | null)[] = generators.map((gen, index) =>
+    gen.next().then((result) => ({ index, result })),
+  );
 
-  while (promises.length > 0) {
-    const wrappedPromises = promises.map((promise, index) =>
-      promise.then((result) => ({ index, result })),
+  while (count > 0) {
+    const activePromises = promises.filter(
+      (p): p is NonNullable<typeof p> => p !== null,
     );
-
-    const { result, index } = await Promise.race(wrappedPromises);
+    const { result, index } = await Promise.race(activePromises);
 
     if (result.done) {
-      generators.splice(index, 1);
-      promises.splice(index, 1);
+      promises[index] = null;
+      count--;
     } else {
-      const generator = generators[index]!;
-      const promise = generator.next();
-
-      promises.splice(index, 1);
-      generators.splice(index, 1);
-
-      generators.push(generator);
-      promises.push(promise);
-
+      promises[index] = generators[index]!.next().then((result) => ({
+        index,
+        result,
+      }));
       yield result.value;
     }
   }
@@ -49,7 +50,7 @@ export async function* bufferAsyncGenerator<T>(
   size: number,
   bufferCallback?: (bufferSize: number) => void,
 ): AsyncGenerator<T> {
-  const buffer: T[] = [];
+  const buffer = new Deque<T>();
   let done = false;
 
   let pwr1 = promiseWithResolvers<void>();
@@ -137,7 +138,7 @@ export function createCallbackGenerator<T>(
   callback: (value: T) => Promise<void> | void;
   generator: AsyncGenerator<T, void, unknown>;
 } {
-  const buffer: T[] = [];
+  const buffer = new Deque<T>();
   let pwr = promiseWithResolvers<void>();
   let drainPwr: ReturnType<typeof promiseWithResolvers<void>> | undefined;
 

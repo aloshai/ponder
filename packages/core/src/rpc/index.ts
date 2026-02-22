@@ -4,6 +4,7 @@ import type { Common } from "@/internal/common.js";
 import type { Logger } from "@/internal/logger.js";
 import type { Chain, SyncBlock, SyncBlockHeader } from "@/internal/types.js";
 import { eth_getBlockByNumber, standardizeBlock } from "@/rpc/actions.js";
+import { Deque } from "@/utils/deque.js";
 import { createQueue } from "@/utils/queue.js";
 import { startClock } from "@/utils/timer.js";
 import { wait } from "@/utils/wait.js";
@@ -101,7 +102,7 @@ type Bucket = {
   isWarmingUp: boolean;
 
   latencyMetadata: {
-    latencies: { value: number; success: boolean }[];
+    latencies: Deque<{ value: number; success: boolean }>;
 
     successfulLatencies: number;
     latencySum: number;
@@ -109,6 +110,8 @@ type Bucket = {
   expectedLatency: number;
 
   rps: { count: number; timestamp: number }[];
+  /** Running total of requests in the current rps window. */
+  rpsRunningTotal: number;
   /** Number of consecutive successful requests. */
   consecutiveSuccessfulRequests: number;
   /** Maximum requests per second (dynamic). */
@@ -138,13 +141,28 @@ const addLatency = (bucket: Bucket, latency: number, success: boolean) => {
 };
 
 /**
+ * Prune stale rps entries older than 10 seconds and update the running total.
+ */
+const pruneRps = (bucket: Bucket) => {
+  const now = Math.floor(Date.now() / 1000);
+  while (bucket.rps.length > 0 && bucket.rps[0]!.timestamp <= now - 10) {
+    bucket.rpsRunningTotal -= bucket.rps[0]!.count;
+    bucket.rps.shift();
+  }
+};
+
+/**
  * Return `true` if the bucket is available to send a request.
  */
 const isAvailable = (bucket: Bucket) => {
   if (bucket.isActive === false) return false;
 
   const now = Math.floor(Date.now() / 1000);
-  const currentRPS = bucket.rps.find((r) => r.timestamp === now);
+  const currentRPS =
+    bucket.rps.length > 0 &&
+    bucket.rps[bucket.rps.length - 1]!.timestamp === now
+      ? bucket.rps[bucket.rps.length - 1]!
+      : undefined;
 
   if (currentRPS && currentRPS.count + 1 > bucket.rpsLimit) {
     return false;
@@ -152,9 +170,8 @@ const isAvailable = (bucket: Bucket) => {
 
   if (bucket.rps.length > 0 && bucket.rps[0]!.timestamp < now) {
     const elapsed = now - bucket.rps[0]!.timestamp;
-    const totalCount = bucket.rps.reduce((acc, rps) => acc + rps.count, 0);
 
-    if (totalCount > bucket.rpsLimit * (1 + elapsed)) {
+    if (bucket.rpsRunningTotal > bucket.rpsLimit * (1 + elapsed)) {
       return false;
     }
   }
@@ -293,13 +310,14 @@ export const createRpc = ({
         isWarmingUp: false,
 
         latencyMetadata: {
-          latencies: [],
+          latencies: new Deque(),
           successfulLatencies: 0,
           latencySum: 0,
         },
         expectedLatency: 200,
 
         rps: [],
+        rpsRunningTotal: 0,
         consecutiveSuccessfulRequests: 0,
         rpsLimit: INITIAL_MAX_RPS,
 
@@ -311,6 +329,14 @@ export const createRpc = ({
 
   /** Tracks all active bucket reactivation timeouts to cleanup during shutdown */
   const timeouts = new Set<NodeJS.Timeout>();
+
+  let bucketAvailableResolvers: Array<() => void> = [];
+
+  const notifyBucketAvailable = () => {
+    const resolvers = bucketAvailableResolvers;
+    bucketAvailableResolvers = [];
+    for (const resolve of resolvers) resolve();
+  };
 
   const scheduleBucketActivation = (bucket: Bucket) => {
     const delay = bucket.reactivationDelay;
@@ -325,6 +351,7 @@ export const createRpc = ({
         hostname: bucket.hostname,
         retry_delay: Math.round(delay),
       });
+      notifyBucketAvailable();
     }, delay);
 
     common.logger.debug({
@@ -339,22 +366,49 @@ export const createRpc = ({
   };
 
   const getBucket = async (): Promise<Bucket> => {
-    let availableBuckets: Bucket[];
-
     // Note: wait for the next event loop to ensure that the bucket rps are updated
     await new Promise((resolve) => setImmediate(resolve));
 
     while (true) {
-      // Remove old request per second data
-      const timestamp = Math.floor(Date.now() / 1000);
       for (const bucket of buckets) {
-        bucket.rps = bucket.rps.filter((r) => r.timestamp > timestamp - 10);
+        pruneRps(bucket);
       }
 
-      availableBuckets = buckets.filter(isAvailable);
+      let bestBucket: Bucket | undefined;
 
-      if (availableBuckets.length > 0) {
-        break;
+      if (Math.random() < EPSILON) {
+        const available: Bucket[] = [];
+        for (const bucket of buckets) {
+          if (isAvailable(bucket)) available.push(bucket);
+        }
+        if (available.length > 0) {
+          bestBucket = available[Math.floor(Math.random() * available.length)]!;
+        }
+      } else {
+        for (const bucket of buckets) {
+          if (!isAvailable(bucket)) continue;
+          if (bestBucket === undefined) {
+            bestBucket = bucket;
+            continue;
+          }
+          const currentLatency = bucket.expectedLatency;
+          const fastestLatency = bestBucket.expectedLatency;
+          if (currentLatency < fastestLatency * (1 - LATENCY_HURDLE_RATE)) {
+            bestBucket = bucket;
+          } else if (
+            currentLatency <= fastestLatency &&
+            bucket.activeConnections < bestBucket.activeConnections
+          ) {
+            bestBucket = bucket;
+          }
+        }
+      }
+
+      if (bestBucket !== undefined) {
+        clearTimeout(noAvailableBucketsTimer);
+        noAvailableBucketsTimer = undefined;
+        bestBucket.activeConnections++;
+        return bestBucket;
       }
 
       if (noAvailableBucketsTimer === undefined) {
@@ -368,39 +422,11 @@ export const createRpc = ({
         }, 5_000);
       }
 
-      await wait(20);
+      await new Promise<void>((resolve) => {
+        bucketAvailableResolvers.push(resolve);
+        setTimeout(resolve, 100);
+      });
     }
-
-    clearTimeout(noAvailableBucketsTimer);
-    noAvailableBucketsTimer = undefined;
-
-    if (Math.random() < EPSILON) {
-      const randomBucket =
-        availableBuckets[Math.floor(Math.random() * availableBuckets.length)]!;
-      randomBucket.activeConnections++;
-      return randomBucket;
-    }
-
-    const fastestBucket = availableBuckets.reduce((fastest, current) => {
-      const currentLatency = current.expectedLatency;
-      const fastestLatency = fastest.expectedLatency;
-
-      if (currentLatency < fastestLatency * (1 - LATENCY_HURDLE_RATE)) {
-        return current;
-      }
-
-      if (
-        currentLatency <= fastestLatency &&
-        current.activeConnections < fastest.activeConnections
-      ) {
-        return current;
-      }
-
-      return fastest;
-    }, availableBuckets[0]!);
-
-    fastestBucket.activeConnections++;
-    return fastestBucket;
   };
 
   const increaseMaxRPS = (bucket: Bucket) => {
@@ -495,6 +521,7 @@ export const createRpc = ({
           } else {
             bucket.rps[bucket.rps.length - 1]!.count++;
           }
+          bucket.rpsRunningTotal++;
 
           requestId = id;
           const response = await bucket.request(body);
@@ -678,6 +705,7 @@ export const createRpc = ({
           await wait(duration);
         } finally {
           bucket.activeConnections--;
+          notifyBucketAvailable();
 
           clearTimeout(surpassTimeout);
         }

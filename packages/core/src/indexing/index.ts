@@ -741,6 +741,8 @@ export const createIndexing = ({
       }
     },
     async processRealtimeEvents({ events }) {
+      let lastEventLoopUpdate = performance.now();
+
       for (let i = 0; i < events.length; i++) {
         const event = events[i]!;
 
@@ -753,6 +755,12 @@ export const createIndexing = ({
           1,
         );
         eventCount[event.eventCallback.name]++;
+
+        const now = performance.now();
+        if (now - lastEventLoopUpdate > EVENT_LOOP_UPDATE_INTERVAL) {
+          lastEventLoopUpdate = now;
+          await new Promise(setImmediate);
+        }
       }
     },
   };
@@ -809,6 +817,11 @@ export const createEventProxy = <
         }
 
         const profile = columnAccessPattern.get(eventName)!;
+
+        if (profile.resolved) {
+          return Reflect.deleteProperty(underlying, prop);
+        }
+
         const isInvalidAccess = prop in underlying === false;
         // @ts-expect-error
         profile[type].add(prop);
@@ -841,6 +854,11 @@ export const createEventProxy = <
         }
 
         const profile = columnAccessPattern.get(eventName)!;
+
+        if (profile.resolved) {
+          return Reflect.set(underlying, prop, value);
+        }
+
         const isInvalidAccess = prop in underlying === false;
         // @ts-expect-error
         profile[type].add(prop);
@@ -866,6 +884,11 @@ export const createEventProxy = <
         }
 
         const profile = columnAccessPattern.get(eventName)!;
+
+        if (profile.resolved) {
+          return Reflect.get(underlying, prop, receiver);
+        }
+
         const isInvalidAccess = prop in underlying === false;
         // @ts-expect-error
         profile[type].add(prop);

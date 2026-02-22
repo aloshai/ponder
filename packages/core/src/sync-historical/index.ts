@@ -45,12 +45,7 @@ import type {
 } from "@/runtime/index.js";
 import type { SyncStore } from "@/sync-store/index.js";
 import { dedupe } from "@/utils/dedupe.js";
-import {
-  type Interval,
-  getChunks,
-  intervalBounds,
-  intervalRange,
-} from "@/utils/interval.js";
+import { type Interval, getChunks, intervalBounds } from "@/utils/interval.js";
 import { promiseAllSettledWithThrow } from "@/utils/promiseAllSettledWithThrow.js";
 import { createQueue } from "@/utils/queue.js";
 import { startClock } from "@/utils/timer.js";
@@ -190,8 +185,9 @@ export const createHistoricalSync = (
       // many addresses
       // Note: it is assumed that `address` is deduplicated
       addressBatches = [];
-      for (let i = 0; i < address.length; i += 50) {
-        addressBatches.push(address.slice(i, i + 50));
+      const batchSize = args.common.options.addressBatchSize;
+      for (let i = 0; i < address.length; i += batchSize) {
+        addressBatches.push(address.slice(i, i + batchSize));
       }
     }
 
@@ -220,16 +216,11 @@ export const createHistoricalSync = (
                 );
                 const coveredRange = lastLogBlock - interval[0] + 1;
                 const logsPerBlock =
-                  coveredRange > 0
-                    ? chunkLogs.length / coveredRange
-                    : 0;
+                  coveredRange > 0 ? chunkLogs.length / coveredRange : 0;
                 const uncoveredBlocks = interval[1] - lastLogBlock;
                 const expectedMissing = logsPerBlock * uncoveredBlocks;
 
-                if (
-                  lastLogBlock < interval[1] &&
-                  expectedMissing > 10
-                ) {
+                if (lastLogBlock < interval[1] && expectedMissing > 10) {
                   logsRequestMetadata.estimatedRange = Math.max(
                     25,
                     lastLogBlock - interval[0],
@@ -1116,9 +1107,18 @@ export const createHistoricalSync = (
           worker: syncBlockData,
         });
 
-        await Promise.all(
-          intervalRange(interval).map((blockNumber) => queue.add(blockNumber)),
-        );
+        let firstError: Error | undefined;
+        for (
+          let blockNumber = interval[0];
+          blockNumber <= interval[1];
+          blockNumber++
+        ) {
+          queue.add(blockNumber).catch((e: Error) => {
+            if (!firstError) firstError = e;
+          });
+        }
+        await queue.onIdle();
+        if (firstError) throw firstError;
       }
 
       args.common.logger.debug(

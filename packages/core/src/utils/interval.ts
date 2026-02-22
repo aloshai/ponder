@@ -85,8 +85,7 @@ export function intervalIntersection(
     }
   }
 
-  // Merge potentially overlapping intervals before returning.
-  return intervalUnion(result);
+  return result;
 }
 
 /**
@@ -106,7 +105,7 @@ export function intervalIntersectionMany(lists: Interval[][]): Interval[] {
     result = intervalIntersection(result, lists[i]!);
   }
 
-  return intervalUnion(result);
+  return result;
 }
 
 /**
@@ -120,9 +119,7 @@ export function intervalDifference(
   initial: Interval[],
   remove: Interval[],
 ): Interval[] {
-  // Create copies to avoid mutating the originals.
   const initial_ = initial.map((interval) => [...interval] as Interval);
-  const remove_ = remove.map((interval) => [...interval] as Interval);
 
   const result: Interval[] = [];
 
@@ -131,7 +128,7 @@ export function intervalDifference(
 
   while (i < initial.length && j < remove.length) {
     const interval1 = initial_[i]!;
-    const interval2 = remove_[j]!;
+    const interval2 = remove[j]!;
 
     if (interval1[1] < interval2[0]) {
       // No overlap, add interval1 to the result
@@ -173,9 +170,12 @@ export function intervalDifference(
  * @returns Bounds of the intervals.
  */
 export function intervalBounds(intervals: Interval[]): Interval {
-  const start = Math.min(...intervals.map((interval) => interval[0]));
-  const end = Math.max(...intervals.map((interval) => interval[1]));
-
+  let start = Number.POSITIVE_INFINITY;
+  let end = Number.NEGATIVE_INFINITY;
+  for (const [s, e] of intervals) {
+    if (s < start) start = s;
+    if (e > end) end = e;
+  }
   return [start, end];
 }
 

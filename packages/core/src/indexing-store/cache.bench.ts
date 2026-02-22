@@ -1,6 +1,6 @@
 import { onchainTable } from "@/index.js";
 import { bench, run } from "mitata";
-import { getCopyText } from "./cache.js";
+import { getCopyText } from "../database/copy.js";
 
 const table = onchainTable("account", (t) => ({
   address: t.hex().primaryKey(),
