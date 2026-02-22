@@ -1317,8 +1317,43 @@ export async function* getLocalSyncGenerator(params: {
             syncStore,
           });
           if (params.chain.disableCache === false) {
+            // Narrow interval insertion: if logs were returned, only mark
+            // up to the max log block as synced for log-type filters.
+            // This prevents permanently caching a range that may have been
+            // silently truncated by the RPC provider.
+            let narrowedIntervals = requiredIntervals;
+            if (logs.length > 0) {
+              let maxLogBlock = 0;
+              for (const log of logs) {
+                const bn = hexToNumber(log.blockNumber);
+                if (bn > maxLogBlock) maxLogBlock = bn;
+              }
+              if (maxLogBlock < interval[1]) {
+                narrowedIntervals = requiredIntervals.map((ri) => {
+                  if (ri.filter.type === "log") {
+                    return {
+                      ...ri,
+                      interval: [
+                        ri.interval[0],
+                        Math.min(ri.interval[1], maxLogBlock),
+                      ] as Interval,
+                    };
+                  }
+                  return ri;
+                });
+                params.common.logger.debug({
+                  msg: "Narrowed log filter interval insertion to max fetched log block",
+                  chain: params.chain.name,
+                  chain_id: params.chain.id,
+                  original_end: interval[1],
+                  narrowed_end: maxLogBlock,
+                  log_count: logs.length,
+                });
+              }
+            }
+
             await syncStore.insertIntervals({
-              intervals: requiredIntervals,
+              intervals: narrowedIntervals,
               factoryIntervals: requiredFactoryIntervals,
               chainId: params.chain.id,
             });

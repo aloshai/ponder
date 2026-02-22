@@ -35,6 +35,8 @@ export type Options = {
 
   factoryAddressCountThreshold: number;
 
+  truncationThreshold: number;
+
   indexingCacheMaxBytes: number;
 
   rpcMaxConcurrency: number;
@@ -113,6 +115,11 @@ export const buildOptions = ({ cliOptions }: { cliOptions: CliOptions }) => {
         : 4,
 
     factoryAddressCountThreshold: 1_000,
+
+    truncationThreshold:
+      process.env.PONDER_TRUNCATION_THRESHOLD !== undefined
+        ? Number(process.env.PONDER_TRUNCATION_THRESHOLD)
+        : 500,
 
     rpcMaxConcurrency: 256,
 

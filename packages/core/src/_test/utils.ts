@@ -673,6 +673,7 @@ export const getChain = (params?: {
     finalityBlockCount: params?.finalityBlockCount ?? 1,
     disableCache: false,
     ethGetLogsBlockRange: undefined,
+    maxLogsPerRequest: undefined,
     viemChain: anvil,
   } satisfies Chain;
 };

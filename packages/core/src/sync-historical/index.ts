@@ -98,23 +98,19 @@ export const createHistoricalSync = (
    */
   let isBlockReceipts = true;
 
-  /**
-   * Data about the range passed to "eth_getLogs" share among all log
-   * filters and log factories.
-   */
-  let logsRequestMetadata: {
-    /** Estimate optimal range to use for "eth_getLogs" requests */
+  type LogsRequestMetadata = {
     estimatedRange: number;
-    /** Range suggested by an error message */
     confirmedRange?: number;
-    /** Track consecutive successes for step-function growth */
     successCount: number;
-  } = {
+  };
+
+  let sharedLogsRequestMetadata: LogsRequestMetadata = {
     estimatedRange: 2_000,
     successCount: 0,
   };
 
-  const TRUNCATION_THRESHOLD = 2_000;
+  const truncationThreshold =
+    args.chain.maxLogsPerRequest ?? args.common.options.truncationThreshold;
 
   ////////
   // Helper functions for sync tasks
@@ -137,12 +133,14 @@ export const createHistoricalSync = (
     { address, topic0, topic1, topic2, topic3, interval }: EthGetLogsParams,
     context?: Parameters<Rpc["request"]>[1],
   ): Promise<SyncLog[]> => {
+    const localMetadata: LogsRequestMetadata = { ...sharedLogsRequestMetadata };
+
     const intervals = getChunks({
       interval,
       maxChunkSize:
         args.chain.ethGetLogsBlockRange ??
-        logsRequestMetadata.confirmedRange ??
-        logsRequestMetadata.estimatedRange,
+        localMetadata.confirmedRange ??
+        localMetadata.estimatedRange,
     });
 
     const topics = [
@@ -151,9 +149,6 @@ export const createHistoricalSync = (
       topic2 ?? null,
       topic3 ?? null,
     ];
-
-    // Note: the `topics` field is very fragile for many rpc providers, and
-    // cannot handle extra "null" topics
 
     if (topics[3] === null) {
       topics.pop();
@@ -168,22 +163,15 @@ export const createHistoricalSync = (
       }
     }
 
-    // Batch large arrays of addresses, handling arrays that are empty
-
     let addressBatches: (Address | Address[] | undefined)[];
 
     if (address === undefined) {
-      // no address (match all)
       addressBatches = [undefined];
     } else if (typeof address === "string") {
-      // single address
       addressBatches = [address];
     } else if (address.length === 0) {
-      // no address (factory with no children)
       return [];
     } else {
-      // many addresses
-      // Note: it is assumed that `address` is deduplicated
       addressBatches = [];
       const batchSize = args.common.options.addressBatchSize;
       for (let i = 0; i < address.length; i += batchSize) {
@@ -207,23 +195,16 @@ export const createHistoricalSync = (
             context,
           )
             .then((chunkLogs) => {
-              if (
-                chunkLogs.length >= TRUNCATION_THRESHOLD &&
-                chunkLogs.length > 0
-              ) {
+              if (chunkLogs.length >= truncationThreshold) {
                 const lastLogBlock = hexToNumber(
                   chunkLogs[chunkLogs.length - 1]!.blockNumber,
                 );
-                const coveredRange = lastLogBlock - interval[0] + 1;
-                const logsPerBlock =
-                  coveredRange > 0 ? chunkLogs.length / coveredRange : 0;
-                const uncoveredBlocks = interval[1] - lastLogBlock;
-                const expectedMissing = logsPerBlock * uncoveredBlocks;
 
-                if (lastLogBlock < interval[1] && expectedMissing > 10) {
-                  logsRequestMetadata.estimatedRange = Math.max(
-                    25,
-                    lastLogBlock - interval[0],
+                if (lastLogBlock < interval[1]) {
+                  const shrunkRange = Math.max(25, lastLogBlock - interval[0]);
+                  sharedLogsRequestMetadata.estimatedRange = Math.min(
+                    sharedLogsRequestMetadata.estimatedRange,
+                    shrunkRange,
                   );
 
                   args.common.logger.warn({
@@ -233,7 +214,7 @@ export const createHistoricalSync = (
                     requested_range: `${interval[0]}-${interval[1]}`,
                     last_log_block: lastLogBlock,
                     log_count: chunkLogs.length,
-                    expected_missing: Math.round(expectedMissing),
+                    threshold: truncationThreshold,
                   });
 
                   args.common.metrics.ponder_sync_truncation_total.inc({
@@ -252,12 +233,33 @@ export const createHistoricalSync = (
                     context,
                   ).then((remainingLogs) => [...chunkLogs, ...remainingLogs]);
                 }
+
+                // lastLogBlock === interval[1]: all logs land in the last block,
+                // but the count >= threshold means truncation within that block
+                // is possible. Halve the range for future requests as a safeguard.
+                if (interval[0] < interval[1]) {
+                  const safeRange = Math.max(
+                    25,
+                    Math.floor((interval[1] - interval[0]) / 2),
+                  );
+                  sharedLogsRequestMetadata.estimatedRange = Math.min(
+                    sharedLogsRequestMetadata.estimatedRange,
+                    safeRange,
+                  );
+                }
+
+                args.common.logger.debug({
+                  msg: "eth_getLogs response at truncation threshold but last log in final block",
+                  chain: args.chain.name,
+                  chain_id: args.chain.id,
+                  range: `${interval[0]}-${interval[1]}`,
+                  log_count: chunkLogs.length,
+                  threshold: truncationThreshold,
+                });
               }
               return chunkLogs;
             })
             .catch((error) => {
-              // Note: skip eth_getLogs range retry logic if the chain
-              // has a custom block range.
               if (args.chain.ethGetLogsBlockRange !== undefined) {
                 throw error;
               }
@@ -287,7 +289,7 @@ export const createHistoricalSync = (
                 range,
               });
 
-              logsRequestMetadata = {
+              sharedLogsRequestMetadata = {
                 estimatedRange: range,
                 confirmedRange: getLogsErrorResponse.isSuggestedRange
                   ? range
@@ -312,23 +314,18 @@ export const createHistoricalSync = (
       return result;
     });
 
-    /**
-     * Dynamically increase the range used in "eth_getLogs" if an
-     * error has been received but the error didn't suggest a range.
-     */
-
-    if (logsRequestMetadata.confirmedRange === undefined) {
-      logsRequestMetadata.successCount++;
+    if (sharedLogsRequestMetadata.confirmedRange === undefined) {
+      sharedLogsRequestMetadata.successCount++;
 
       const multiplier =
-        logsRequestMetadata.successCount <= 3
+        sharedLogsRequestMetadata.successCount <= 3
           ? 2
-          : logsRequestMetadata.successCount <= 8
+          : sharedLogsRequestMetadata.successCount <= 8
             ? 1.5
             : 1.1;
 
-      logsRequestMetadata.estimatedRange = Math.round(
-        logsRequestMetadata.estimatedRange * multiplier,
+      sharedLogsRequestMetadata.estimatedRange = Math.round(
+        sharedLogsRequestMetadata.estimatedRange * multiplier,
       );
     }
 
@@ -551,12 +548,27 @@ export const createHistoricalSync = (
         if (hasAddress === false || hasTopic1 || hasTopic2 || hasTopic3) {
           if (isAddressFactory(filter.address)) {
             const childAddresses = args.childAddresses.get(filter.address.id)!;
+            const droppedFilter =
+              childAddresses.size >=
+              args.common.options.factoryAddressCountThreshold;
+            if (droppedFilter) {
+              args.common.logger.warn({
+                msg: "Factory child address count exceeds threshold, dropping address filter for eth_getLogs — truncation risk is elevated",
+                chain: args.chain.name,
+                chain_id: args.chain.id,
+                factory: filter.address.id,
+                child_count: childAddresses.size,
+                threshold: args.common.options.factoryAddressCountThreshold,
+              });
+              sharedLogsRequestMetadata.estimatedRange = Math.min(
+                sharedLogsRequestMetadata.estimatedRange,
+                100,
+              );
+            }
             singleEthGetLogsParams.push({
-              address:
-                childAddresses.size >=
-                args.common.options.factoryAddressCountThreshold
-                  ? undefined
-                  : Array.from(childAddresses.keys()),
+              address: droppedFilter
+                ? undefined
+                : Array.from(childAddresses.keys()),
               topic0: filter.topic0,
               topic1: filter.topic1,
               topic2: filter.topic2,
@@ -589,12 +601,27 @@ export const createHistoricalSync = (
         if (mergedEthGetLogsParams.has(addressKey) === false) {
           if (isAddressFactory(filter.address)) {
             const childAddresses = args.childAddresses.get(filter.address.id)!;
+            const droppedFilter =
+              childAddresses.size >=
+              args.common.options.factoryAddressCountThreshold;
+            if (droppedFilter) {
+              args.common.logger.warn({
+                msg: "Factory child address count exceeds threshold, dropping address filter for eth_getLogs — truncation risk is elevated",
+                chain: args.chain.name,
+                chain_id: args.chain.id,
+                factory: filter.address.id,
+                child_count: childAddresses.size,
+                threshold: args.common.options.factoryAddressCountThreshold,
+              });
+              sharedLogsRequestMetadata.estimatedRange = Math.min(
+                sharedLogsRequestMetadata.estimatedRange,
+                100,
+              );
+            }
             mergedEthGetLogsParams.set(addressKey, {
-              address:
-                childAddresses.size >=
-                args.common.options.factoryAddressCountThreshold
-                  ? undefined
-                  : Array.from(childAddresses.keys()),
+              address: droppedFilter
+                ? undefined
+                : Array.from(childAddresses.keys()),
               topic0: filter.topic0,
               topic1: filter.topic1,
               topic2: filter.topic2,

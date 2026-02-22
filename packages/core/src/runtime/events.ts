@@ -566,8 +566,8 @@ export const decodeEvents = (
         const selector = toEventSelector(eventCallback.abiItem as AbiEvent);
         if (!logDecodeFailureSelectors.has(selector)) {
           logDecodeFailureSelectors.add(selector);
-          common.logger.debug({
-            msg: "Failed to decode matched event log using provided ABI item",
+          common.logger.warn({
+            msg: "Failed to decode matched event log using provided ABI item — event will be skipped",
             chain: eventCallback.chain.name,
             chain_id: eventCallback.chain.id,
             event: eventCallback.name,
@@ -620,8 +620,8 @@ export const decodeEvents = (
         );
         if (!traceDecodeFailureSelectors.has(selector)) {
           traceDecodeFailureSelectors.add(selector);
-          common.logger.debug({
-            msg: "Failed to decode matched call trace using provided ABI item",
+          common.logger.warn({
+            msg: "Failed to decode matched call trace using provided ABI item — trace will be skipped",
             chain: eventCallback.chain.name,
             chain_id: eventCallback.chain.id,
             function: eventCallback.name,

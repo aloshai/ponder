@@ -109,6 +109,12 @@ type ChainConfig<chain> = {
    * attempt to determine the block range automatically based on error messages.
    */
   ethGetLogsBlockRange?: number;
+  /**
+   * Maximum number of logs a provider returns per eth_getLogs request.
+   * If the response contains this many logs, it is treated as potentially
+   * truncated and the range is retried with smaller chunks.
+   */
+  maxLogsPerRequest?: number;
 };
 
 type ChainsConfig<chains> = {} extends chains
