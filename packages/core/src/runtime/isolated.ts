@@ -162,10 +162,13 @@ export async function runIsolated({
   common.stateManager.initializeChains([chain]);
   common.memoryMonitor.start();
   common.stateManager.setChainProgress(chain.name, {
-    currentBlock: Number(syncProgress.start.number.replace("0x", ""), 16),
+    currentBlock: Number.parseInt(
+      syncProgress.start.number.replace("0x", ""),
+      16,
+    ),
     targetBlock: syncProgress.end
-      ? Number(syncProgress.end.number.replace("0x", ""), 16)
-      : Number(syncProgress.finalized.number.replace("0x", ""), 16),
+      ? Number.parseInt(syncProgress.end.number.replace("0x", ""), 16)
+      : Number.parseInt(syncProgress.finalized.number.replace("0x", ""), 16),
   });
 
   const start = Number(

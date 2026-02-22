@@ -114,10 +114,15 @@ export const createHistoricalSync = (
     confirmedRange?: number;
     /** Track consecutive successes for step-function growth */
     successCount: number;
+    /** Whether truncation was ever detected — limits range growth */
+    truncationDetected: boolean;
   } = {
     estimatedRange: 2_000,
     successCount: 0,
+    truncationDetected: false,
   };
+
+  const TRUNCATION_THRESHOLD = 2_000;
 
   ////////
   // Helper functions for sync tasks
@@ -207,51 +212,97 @@ export const createHistoricalSync = (
               },
             ],
             context,
-          ).catch((error) => {
-            // Note: skip eth_getLogs range retry logic if the chain
-            // has a custom block range.
-            if (args.chain.ethGetLogsBlockRange !== undefined) {
-              throw error;
-            }
+          )
+            .then((chunkLogs) => {
+              if (
+                chunkLogs.length >= TRUNCATION_THRESHOLD &&
+                chunkLogs.length > 0
+              ) {
+                const lastLogBlock = hexToNumber(
+                  chunkLogs[chunkLogs.length - 1]!.blockNumber,
+                );
+                if (lastLogBlock < interval[1]) {
+                  logsRequestMetadata.truncationDetected = true;
+                  logsRequestMetadata.estimatedRange = Math.max(
+                    25,
+                    lastLogBlock - interval[0],
+                  );
+                  logsRequestMetadata.successCount = 0;
 
-            const getLogsErrorResponse = getLogsRetryHelper({
-              params: [
-                {
-                  address,
-                  topics,
-                  fromBlock: toHex(interval[0]),
-                  toBlock: toHex(interval[1]),
-                },
-              ],
-              error: error as RpcError,
-            });
+                  args.common.logger.warn({
+                    msg: "eth_getLogs truncation detected, retrying remaining range",
+                    chain: args.chain.name,
+                    chain_id: args.chain.id,
+                    requested_range: `${interval[0]}-${interval[1]}`,
+                    last_log_block: lastLogBlock,
+                    log_count: chunkLogs.length,
+                  });
 
-            if (getLogsErrorResponse.shouldRetry === false) throw error;
+                  args.common.metrics.ponder_sync_truncation_total.inc({
+                    chain: args.chain.name,
+                  });
 
-            const range =
-              hexToNumber(getLogsErrorResponse.ranges[0]!.toBlock) -
-              hexToNumber(getLogsErrorResponse.ranges[0]!.fromBlock);
+                  return syncLogsDynamic(
+                    {
+                      address,
+                      topic0,
+                      topic1,
+                      topic2,
+                      topic3,
+                      interval: [lastLogBlock + 1, interval[1]],
+                    },
+                    context,
+                  ).then((remainingLogs) => [...chunkLogs, ...remainingLogs]);
+                }
+              }
+              return chunkLogs;
+            })
+            .catch((error) => {
+              // Note: skip eth_getLogs range retry logic if the chain
+              // has a custom block range.
+              if (args.chain.ethGetLogsBlockRange !== undefined) {
+                throw error;
+              }
 
-            args.common.logger.debug({
-              msg: "Updated eth_getLogs range",
-              chain: args.chain.name,
-              chain_id: args.chain.id,
-              range,
-            });
+              const getLogsErrorResponse = getLogsRetryHelper({
+                params: [
+                  {
+                    address,
+                    topics,
+                    fromBlock: toHex(interval[0]),
+                    toBlock: toHex(interval[1]),
+                  },
+                ],
+                error: error as RpcError,
+              });
 
-            logsRequestMetadata = {
-              estimatedRange: range,
-              confirmedRange: getLogsErrorResponse.isSuggestedRange
-                ? range
-                : undefined,
-              successCount: 0,
-            };
+              if (getLogsErrorResponse.shouldRetry === false) throw error;
 
-            return syncLogsDynamic(
-              { address, topic0, topic1, topic2, topic3, interval },
-              context,
-            );
-          }),
+              const range =
+                hexToNumber(getLogsErrorResponse.ranges[0]!.toBlock) -
+                hexToNumber(getLogsErrorResponse.ranges[0]!.fromBlock);
+
+              args.common.logger.debug({
+                msg: "Updated eth_getLogs range",
+                chain: args.chain.name,
+                chain_id: args.chain.id,
+                range,
+              });
+
+              logsRequestMetadata = {
+                estimatedRange: range,
+                confirmedRange: getLogsErrorResponse.isSuggestedRange
+                  ? range
+                  : undefined,
+                successCount: 0,
+                truncationDetected: logsRequestMetadata.truncationDetected,
+              };
+
+              return syncLogsDynamic(
+                { address, topic0, topic1, topic2, topic3, interval },
+                context,
+              );
+            }),
         ),
       ),
     ).then((logs) => {
@@ -272,8 +323,9 @@ export const createHistoricalSync = (
     if (logsRequestMetadata.confirmedRange === undefined) {
       logsRequestMetadata.successCount++;
 
-      const multiplier =
-        logsRequestMetadata.successCount <= 3
+      const multiplier = logsRequestMetadata.truncationDetected
+        ? 1.05
+        : logsRequestMetadata.successCount <= 3
           ? 2
           : logsRequestMetadata.successCount <= 8
             ? 1.5

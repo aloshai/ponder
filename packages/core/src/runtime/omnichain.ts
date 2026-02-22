@@ -200,10 +200,13 @@ export async function runOmnichain({
   common.memoryMonitor.start();
   for (const chain of indexingBuild.chains) {
     const { syncProgress } = perChainSync.get(chain)!;
-    const startBlock = Number(syncProgress.start.number.replace("0x", ""), 16);
+    const startBlock = Number.parseInt(
+      syncProgress.start.number.replace("0x", ""),
+      16,
+    );
     const targetBlock = syncProgress.end
-      ? Number(syncProgress.end.number.replace("0x", ""), 16)
-      : Number(syncProgress.finalized.number.replace("0x", ""), 16);
+      ? Number.parseInt(syncProgress.end.number.replace("0x", ""), 16)
+      : Number.parseInt(syncProgress.finalized.number.replace("0x", ""), 16);
     common.stateManager.setChainProgress(chain.name, {
       currentBlock: startBlock,
       targetBlock,

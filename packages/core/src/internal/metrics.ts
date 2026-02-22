@@ -87,6 +87,8 @@ export class MetricsService {
   ponder_historical_cached_blocks: prometheus.Gauge<"chain">;
   ponder_historical_completed_blocks: prometheus.Gauge<"chain">;
 
+  ponder_sync_truncation_total: prometheus.Counter<"chain">;
+
   ponder_realtime_reorg_total: prometheus.Counter<"chain">;
   ponder_realtime_latency: prometheus.Histogram<"chain">;
   ponder_realtime_block_arrival_latency: prometheus.Histogram<"chain">;
@@ -325,6 +327,14 @@ export class MetricsService {
       aggregator: "max",
     });
 
+    this.ponder_sync_truncation_total = new prometheus.Counter({
+      name: "ponder_sync_truncation_total",
+      help: "Count of eth_getLogs silent truncation detections",
+      labelNames: ["chain"] as const,
+      registers: [this.registry],
+      aggregator: "sum",
+    });
+
     this.ponder_realtime_reorg_total = new prometheus.Counter({
       name: "ponder_realtime_reorg_total",
       help: "Count of how many re-orgs have occurred",
@@ -507,6 +517,7 @@ export class MetricsService {
     this.ponder_historical_total_blocks.reset();
     this.ponder_historical_cached_blocks.reset();
     this.ponder_historical_completed_blocks.reset();
+    this.ponder_sync_truncation_total.reset();
     this.ponder_realtime_reorg_total.reset();
     this.ponder_rpc_request_duration.reset();
     this.ponder_rpc_request_error_total.reset();

@@ -143,6 +143,11 @@ export async function createServer({
       );
 
       const status: Status = {};
+      const indexing: Record<
+        string,
+        { state: string; progress: number; eta: number | undefined }
+      > = {};
+
       for (const { chainName, chainId, latestCheckpoint } of checkpoints.sort(
         (a, b) => (a.chainId > b.chainId ? 1 : -1),
       )) {
@@ -155,15 +160,18 @@ export async function createServer({
               decodeCheckpoint(latestCheckpoint).blockTimestamp,
             ),
           },
+        };
+        indexing[chainName] = {
           state: chainState?.phase ?? "backfilling",
           progress: chainState?.progress ?? 0,
-          eta: chainState?.eta ?? null,
+          eta: chainState?.eta,
         };
       }
 
       return c.json({
         state: globalState.phase,
         chains: status,
+        indexing,
         memory: common.memoryMonitor.getSnapshot(),
       });
     })
