@@ -1,0 +1,783 @@
+import { debug_traceBlockByNumber, eth_getBlockByNumber, eth_getBlockReceipts, eth_getLogs, eth_getTransactionReceipt, validateLogsAndBlock, validateReceiptsAndBlock, validateTracesAndBlock, validateTransactionsAndBlock, } from '../rpc/actions.js';
+import { getChildAddress, isAddressFactory, isAddressMatched, isBlockFilterMatched, isBlockInFilter, isLogFactoryMatched, isLogFilterMatched, isTraceFilterMatched, isTransactionFilterMatched, isTransferFilterMatched, } from '../runtime/filter.js';
+import { dedupe } from '../utils/dedupe.js';
+import { getChunks, intervalBounds } from '../utils/interval.js';
+import { promiseAllSettledWithThrow } from '../utils/promiseAllSettledWithThrow.js';
+import { createQueue } from '../utils/queue.js';
+import { startClock } from '../utils/timer.js';
+import { getLogsRetryHelper } from "@ponder/utils";
+import { hexToNumber, numberToHex, toHex, zeroHash, } from "viem";
+export const createHistoricalSync = (args) => {
+    /**
+     * Flag to fetch transaction receipts through eth_getBlockReceipts (true) or eth_getTransactionReceipt (false)
+     */
+    let isBlockReceipts = true;
+    let sharedLogsRequestMetadata = {
+        estimatedRange: 2000,
+        successCount: 0,
+    };
+    const truncationThreshold = args.chain.maxLogsPerRequest ?? args.common.options.truncationThreshold;
+    /**
+     * Split "eth_getLogs" requests into ranges inferred from errors
+     * and batch requests.
+     */
+    const syncLogsDynamic = async ({ address, topic0, topic1, topic2, topic3, interval }, context) => {
+        const localMetadata = { ...sharedLogsRequestMetadata };
+        const intervals = getChunks({
+            interval,
+            maxChunkSize: args.chain.ethGetLogsBlockRange ??
+                localMetadata.confirmedRange ??
+                localMetadata.estimatedRange,
+        });
+        const topics = [
+            topic0 ?? null,
+            topic1 ?? null,
+            topic2 ?? null,
+            topic3 ?? null,
+        ];
+        if (topics[3] === null) {
+            topics.pop();
+            if (topics[2] === null) {
+                topics.pop();
+                if (topics[1] === null) {
+                    topics.pop();
+                    if (topics[0] === null) {
+                        topics.pop();
+                    }
+                }
+            }
+        }
+        let addressBatches;
+        if (address === undefined) {
+            addressBatches = [undefined];
+        }
+        else if (typeof address === "string") {
+            addressBatches = [address];
+        }
+        else if (address.length === 0) {
+            return [];
+        }
+        else {
+            addressBatches = [];
+            const batchSize = args.common.options.addressBatchSize;
+            for (let i = 0; i < address.length; i += batchSize) {
+                addressBatches.push(address.slice(i, i + batchSize));
+            }
+        }
+        const logs = await Promise.all(intervals.flatMap((interval) => addressBatches.map((address) => eth_getLogs(args.rpc, [
+            {
+                address,
+                topics,
+                fromBlock: numberToHex(interval[0]),
+                toBlock: numberToHex(interval[1]),
+            },
+        ], context)
+            .then((chunkLogs) => {
+            if (chunkLogs.length >= truncationThreshold) {
+                const lastLogBlock = hexToNumber(chunkLogs[chunkLogs.length - 1].blockNumber);
+                if (lastLogBlock < interval[1]) {
+                    const shrunkRange = Math.max(25, lastLogBlock - interval[0]);
+                    sharedLogsRequestMetadata.estimatedRange = Math.min(sharedLogsRequestMetadata.estimatedRange, shrunkRange);
+                    args.common.logger.warn({
+                        msg: "eth_getLogs truncation detected, retrying remaining range",
+                        chain: args.chain.name,
+                        chain_id: args.chain.id,
+                        requested_range: `${interval[0]}-${interval[1]}`,
+                        last_log_block: lastLogBlock,
+                        log_count: chunkLogs.length,
+                        threshold: truncationThreshold,
+                    });
+                    args.common.metrics.ponder_sync_truncation_total.inc({
+                        chain: args.chain.name,
+                    });
+                    return syncLogsDynamic({
+                        address,
+                        topic0,
+                        topic1,
+                        topic2,
+                        topic3,
+                        interval: [lastLogBlock + 1, interval[1]],
+                    }, context).then((remainingLogs) => [...chunkLogs, ...remainingLogs]);
+                }
+                // lastLogBlock === interval[1]: all logs land in the last block,
+                // but the count >= threshold means truncation within that block
+                // is possible. Halve the range for future requests as a safeguard.
+                if (interval[0] < interval[1]) {
+                    const safeRange = Math.max(25, Math.floor((interval[1] - interval[0]) / 2));
+                    sharedLogsRequestMetadata.estimatedRange = Math.min(sharedLogsRequestMetadata.estimatedRange, safeRange);
+                }
+                args.common.logger.debug({
+                    msg: "eth_getLogs response at truncation threshold but last log in final block",
+                    chain: args.chain.name,
+                    chain_id: args.chain.id,
+                    range: `${interval[0]}-${interval[1]}`,
+                    log_count: chunkLogs.length,
+                    threshold: truncationThreshold,
+                });
+            }
+            return chunkLogs;
+        })
+            .catch((error) => {
+            if (args.chain.ethGetLogsBlockRange !== undefined) {
+                throw error;
+            }
+            const getLogsErrorResponse = getLogsRetryHelper({
+                params: [
+                    {
+                        address,
+                        topics,
+                        fromBlock: toHex(interval[0]),
+                        toBlock: toHex(interval[1]),
+                    },
+                ],
+                error: error,
+            });
+            if (getLogsErrorResponse.shouldRetry === false)
+                throw error;
+            const range = hexToNumber(getLogsErrorResponse.ranges[0].toBlock) -
+                hexToNumber(getLogsErrorResponse.ranges[0].fromBlock);
+            args.common.logger.debug({
+                msg: "Updated eth_getLogs range",
+                chain: args.chain.name,
+                chain_id: args.chain.id,
+                range,
+            });
+            sharedLogsRequestMetadata = {
+                estimatedRange: range,
+                confirmedRange: getLogsErrorResponse.isSuggestedRange
+                    ? range
+                    : undefined,
+                successCount: 0,
+            };
+            return syncLogsDynamic({ address, topic0, topic1, topic2, topic3, interval }, context);
+        })))).then((logs) => {
+            const result = [];
+            for (const _logs of logs) {
+                for (const log of _logs) {
+                    result.push(log);
+                }
+            }
+            return result;
+        });
+        if (sharedLogsRequestMetadata.confirmedRange === undefined) {
+            sharedLogsRequestMetadata.successCount++;
+            const multiplier = sharedLogsRequestMetadata.successCount <= 3
+                ? 2
+                : sharedLogsRequestMetadata.successCount <= 8
+                    ? 1.5
+                    : 1.1;
+            sharedLogsRequestMetadata.estimatedRange = Math.round(sharedLogsRequestMetadata.estimatedRange * multiplier);
+        }
+        return logs;
+    };
+    const syncTransactionReceipts = async (block, transactionHashes, context) => {
+        if (transactionHashes.size === 0) {
+            return [];
+        }
+        if (isBlockReceipts === false) {
+            const transactionReceipts = await Promise.all(Array.from(transactionHashes).map(async (hash) => {
+                const receipt = await eth_getTransactionReceipt(args.rpc, [hash], context);
+                validateReceiptsAndBlock([receipt], block, {
+                    method: "eth_getTransactionReceipt",
+                    params: [hash],
+                }, {
+                    method: "eth_getBlockByNumber",
+                    params: [block.number, true],
+                });
+                return receipt;
+            }));
+            return transactionReceipts;
+        }
+        let blockReceipts;
+        try {
+            blockReceipts = await eth_getBlockReceipts(args.rpc, [block.hash], context);
+        }
+        catch (_error) {
+            const error = _error;
+            args.common.logger.warn({
+                msg: "Caught eth_getBlockReceipts error, switching to eth_getTransactionReceipt method",
+                action: "fetch_block_data",
+                chain: args.chain.name,
+                chain_id: args.chain.id,
+                error,
+            });
+            isBlockReceipts = false;
+            return syncTransactionReceipts(block, transactionHashes, context);
+        }
+        validateReceiptsAndBlock(blockReceipts, block, {
+            method: "eth_getBlockReceipts",
+            params: [block.hash],
+        }, {
+            method: "eth_getBlockByNumber",
+            params: [block.number, true],
+        });
+        const transactionReceipts = blockReceipts.filter((receipt) => transactionHashes.has(receipt.transactionHash));
+        return transactionReceipts;
+    };
+    /**
+     * Fetch child addresses for `factory` within `interval`
+     *
+     * @dev Newly fetched child addresses are added into `args.childAddresses`
+     */
+    const syncAddressFactory = async (factory, interval, context) => {
+        const logs = await syncLogsDynamic({
+            address: factory.address,
+            topic0: factory.eventSelector,
+            interval,
+        }, context);
+        const childAddresses = new Map();
+        const childAddressesRecord = args.childAddresses.get(factory.id);
+        const childAddressDecodeFailureIds = new Set();
+        let childAddressDecodeFailureCount = 0;
+        let childAddressDecodeSuccessCount = 0;
+        for (const log of logs) {
+            if (isLogFactoryMatched({ factory, log })) {
+                let address;
+                try {
+                    address = getChildAddress({ log, factory });
+                    childAddressDecodeSuccessCount++;
+                }
+                catch (error) {
+                    if (factory.address === undefined) {
+                        childAddressDecodeFailureCount++;
+                        if (childAddressDecodeFailureIds.has(factory.id) === false) {
+                            childAddressDecodeFailureIds.add(factory.id);
+                            args.common.logger.debug({
+                                msg: "Failed to extract child address from log matched by factory using the provided ABI item",
+                                chain: args.chain.name,
+                                chain_id: args.chain.id,
+                                factory: factory.sourceId,
+                                block_number: hexToNumber(log.blockNumber),
+                                log_index: hexToNumber(log.logIndex),
+                                data: log.data,
+                                topics: JSON.stringify(log.topics),
+                            });
+                        }
+                        continue;
+                    }
+                    else {
+                        throw error;
+                    }
+                }
+                const existingBlockNumber = childAddressesRecord.get(address);
+                const newBlockNumber = hexToNumber(log.blockNumber);
+                if (existingBlockNumber === undefined ||
+                    existingBlockNumber > newBlockNumber) {
+                    childAddresses.set(address, newBlockNumber);
+                    childAddressesRecord.set(address, newBlockNumber);
+                }
+            }
+        }
+        if (childAddressDecodeFailureCount > 0) {
+            args.common.logger.debug({
+                msg: "Logs matched by factory contained child addresses that could not be extracted",
+                failure_count: childAddressDecodeFailureCount,
+                success_count: childAddressDecodeSuccessCount,
+            });
+        }
+        return childAddresses;
+    };
+    return {
+        async syncBlockRangeData({ interval, requiredIntervals, requiredFactoryIntervals, syncStore, }) {
+            const context = {
+                logger: args.common.logger.child({ action: "fetch_block_data" }),
+            };
+            const endClock = startClock();
+            const childAddresses = new Map();
+            // Dedupe factory intervals by factory id
+            const factoryIntervalsById = new Map();
+            for (const { factory, interval } of requiredFactoryIntervals) {
+                if (factoryIntervalsById.has(factory.id)) {
+                    const existingInterval = factoryIntervalsById.get(factory.id).interval;
+                    factoryIntervalsById.get(factory.id).interval = intervalBounds([
+                        existingInterval,
+                        interval,
+                    ]);
+                }
+                else {
+                    factoryIntervalsById.set(factory.id, { factory, interval });
+                }
+            }
+            requiredFactoryIntervals = Array.from(factoryIntervalsById.values());
+            await Promise.all(requiredFactoryIntervals.map(async ({ factory, interval }) => {
+                childAddresses.set(factory.id, await syncAddressFactory(factory, interval, context));
+            }));
+            const mergedEthGetLogsParams = new Map();
+            const singleEthGetLogsParams = [];
+            for (const { filter, interval } of requiredIntervals) {
+                if (filter.type !== "log")
+                    continue;
+                const hasAddress = filter.address !== undefined;
+                const hasTopic1 = filter.topic1 !== undefined;
+                const hasTopic2 = filter.topic2 !== undefined;
+                const hasTopic3 = filter.topic3 !== undefined;
+                if (hasAddress === false || hasTopic1 || hasTopic2 || hasTopic3) {
+                    if (isAddressFactory(filter.address)) {
+                        const childAddresses = args.childAddresses.get(filter.address.id);
+                        const droppedFilter = childAddresses.size >=
+                            args.common.options.factoryAddressCountThreshold;
+                        if (droppedFilter) {
+                            args.common.logger.warn({
+                                msg: "Factory child address count exceeds threshold, dropping address filter for eth_getLogs — truncation risk is elevated",
+                                chain: args.chain.name,
+                                chain_id: args.chain.id,
+                                factory: filter.address.id,
+                                child_count: childAddresses.size,
+                                threshold: args.common.options.factoryAddressCountThreshold,
+                            });
+                            sharedLogsRequestMetadata.estimatedRange = Math.min(sharedLogsRequestMetadata.estimatedRange, 100);
+                        }
+                        singleEthGetLogsParams.push({
+                            address: droppedFilter
+                                ? undefined
+                                : Array.from(childAddresses.keys()),
+                            topic0: filter.topic0,
+                            topic1: filter.topic1,
+                            topic2: filter.topic2,
+                            topic3: filter.topic3,
+                            interval,
+                        });
+                    }
+                    else {
+                        singleEthGetLogsParams.push({
+                            address: filter.address,
+                            topic0: filter.topic0,
+                            topic1: filter.topic1,
+                            topic2: filter.topic2,
+                            topic3: filter.topic3,
+                            interval,
+                        });
+                    }
+                    continue;
+                }
+                let addressKey;
+                if (isAddressFactory(filter.address)) {
+                    addressKey = filter.address.id;
+                }
+                else if (Array.isArray(filter.address)) {
+                    addressKey = filter.address.join("_");
+                }
+                else {
+                    addressKey = filter.address;
+                }
+                if (mergedEthGetLogsParams.has(addressKey) === false) {
+                    if (isAddressFactory(filter.address)) {
+                        const childAddresses = args.childAddresses.get(filter.address.id);
+                        const droppedFilter = childAddresses.size >=
+                            args.common.options.factoryAddressCountThreshold;
+                        if (droppedFilter) {
+                            args.common.logger.warn({
+                                msg: "Factory child address count exceeds threshold, dropping address filter for eth_getLogs — truncation risk is elevated",
+                                chain: args.chain.name,
+                                chain_id: args.chain.id,
+                                factory: filter.address.id,
+                                child_count: childAddresses.size,
+                                threshold: args.common.options.factoryAddressCountThreshold,
+                            });
+                            sharedLogsRequestMetadata.estimatedRange = Math.min(sharedLogsRequestMetadata.estimatedRange, 100);
+                        }
+                        mergedEthGetLogsParams.set(addressKey, {
+                            address: droppedFilter
+                                ? undefined
+                                : Array.from(childAddresses.keys()),
+                            topic0: filter.topic0,
+                            topic1: filter.topic1,
+                            topic2: filter.topic2,
+                            topic3: filter.topic3,
+                            interval,
+                        });
+                    }
+                    else {
+                        mergedEthGetLogsParams.set(addressKey, {
+                            address: filter.address,
+                            topic0: filter.topic0,
+                            topic1: filter.topic1,
+                            topic2: filter.topic2,
+                            topic3: filter.topic3,
+                            interval,
+                        });
+                    }
+                }
+                else {
+                    const existingInterval = mergedEthGetLogsParams.get(addressKey).interval;
+                    const existingTopic0 = mergedEthGetLogsParams.get(addressKey)
+                        .topic0;
+                    if (Array.isArray(existingTopic0)) {
+                        if (existingTopic0.includes(filter.topic0) === false) {
+                            mergedEthGetLogsParams.get(addressKey).topic0 = [
+                                ...existingTopic0,
+                                filter.topic0,
+                            ];
+                        }
+                    }
+                    else {
+                        if (existingTopic0 !== filter.topic0) {
+                            mergedEthGetLogsParams.get(addressKey).topic0 = [
+                                existingTopic0,
+                                filter.topic0,
+                            ];
+                        }
+                    }
+                    mergedEthGetLogsParams.get(addressKey).interval = intervalBounds([
+                        existingInterval,
+                        interval,
+                    ]);
+                }
+            }
+            const ethGetLogsParams = dedupe([
+                ...singleEthGetLogsParams,
+                ...Array.from(mergedEthGetLogsParams.values()),
+            ], (params) => JSON.stringify(params));
+            let logs = [];
+            await Promise.all(ethGetLogsParams.map(async (params) => {
+                const _logs = await syncLogsDynamic(params, context);
+                for (const log of _logs) {
+                    logs.push(log);
+                }
+            }));
+            // Remove duplicate logs that may have resulted from intersecting
+            // filters.
+            logs = dedupe(logs, (log) => `${log.blockNumber}_${log.logIndex}`);
+            for (const log of logs) {
+                if (log.transactionHash === zeroHash) {
+                    args.common.logger.warn({
+                        msg: "Detected log with empty transaction hash. This is expected for some chains like ZKsync.",
+                        action: "fetch_block_data",
+                        chain: args.chain.name,
+                        chain_id: args.chain.id,
+                        number: hexToNumber(log.blockNumber),
+                        hash: log.blockHash,
+                        logIndex: hexToNumber(log.logIndex),
+                    });
+                }
+            }
+            let childAddressCount = 0;
+            for (const { size } of childAddresses.values()) {
+                childAddressCount += size;
+            }
+            args.common.logger.debug({
+                msg: "Fetched block range data",
+                chain: args.chain.name,
+                chain_id: args.chain.id,
+                block_range: JSON.stringify(interval),
+                log_count: logs.length,
+                child_address_count: childAddressCount,
+                duration: endClock(),
+            }, ["chain", "block_range"]);
+            await promiseAllSettledWithThrow(Array.from(childAddresses.entries()).map(([factoryId, childAddresses]) => syncStore.insertChildAddresses({
+                factory: factoryIntervalsById.get(factoryId).factory,
+                childAddresses,
+                chainId: args.chain.id,
+            }, context)));
+            return logs;
+        },
+        async syncBlockData({ syncStore, interval, requiredIntervals, logs }) {
+            const context = {
+                logger: args.common.logger.child({ action: "fetch_block_data" }),
+            };
+            const endClock = startClock();
+            const blockFilters = [];
+            const transactionFilters = [];
+            const traceFilters = [];
+            const logFilters = [];
+            const transferFilters = [];
+            for (const { filter } of requiredIntervals) {
+                switch (filter.type) {
+                    case "block": {
+                        blockFilters.push(filter);
+                        break;
+                    }
+                    case "transaction": {
+                        transactionFilters.push(filter);
+                        break;
+                    }
+                    case "trace": {
+                        traceFilters.push(filter);
+                        break;
+                    }
+                    case "log": {
+                        logFilters.push(filter);
+                        break;
+                    }
+                    case "transfer": {
+                        transferFilters.push(filter);
+                        break;
+                    }
+                }
+            }
+            const perBlockLogs = new Map();
+            for (const log of logs) {
+                const blockNumber = hexToNumber(log.blockNumber);
+                if (perBlockLogs.has(blockNumber) === false) {
+                    perBlockLogs.set(blockNumber, []);
+                }
+                perBlockLogs.get(blockNumber).push(log);
+            }
+            let closestToTipBlock;
+            const syncBlockData = async (blockNumber) => {
+                let block;
+                const requiredTransactions = new Set();
+                const requiredTransactionReceipts = new Set();
+                ////////
+                // Logs
+                ////////
+                let logs = [];
+                if (perBlockLogs.has(blockNumber)) {
+                    block = await eth_getBlockByNumber(args.rpc, [numberToHex(blockNumber), true], context);
+                    logs = perBlockLogs.get(blockNumber).filter((log) => {
+                        let isMatched = false;
+                        for (const filter of logFilters) {
+                            if (isLogFilterMatched({ filter, log }) &&
+                                (isAddressFactory(filter.address)
+                                    ? isAddressMatched({
+                                        address: log.address,
+                                        blockNumber,
+                                        childAddresses: args.childAddresses.get(filter.address.id),
+                                    })
+                                    : true)) {
+                                isMatched = true;
+                                requiredTransactions.add(log.transactionHash);
+                                if (filter.hasTransactionReceipt) {
+                                    requiredTransactionReceipts.add(log.transactionHash);
+                                    // skip to next log
+                                    break;
+                                }
+                            }
+                        }
+                        return isMatched;
+                    });
+                    if (logs.length > 0) {
+                        // Note: `logsRequest` could be more accurate by tracking the exact
+                        // request made to include `address` and `topics`.
+                        validateLogsAndBlock(logs, block, {
+                            method: "eth_getLogs",
+                            params: [
+                                {
+                                    fromBlock: toHex(blockNumber),
+                                    toBlock: toHex(blockNumber),
+                                },
+                            ],
+                        }, {
+                            method: "eth_getBlockByNumber",
+                            params: [toHex(blockNumber), true],
+                        });
+                    }
+                }
+                ////////
+                // Traces
+                ////////
+                const shouldRequestTraces = traceFilters.some((filter) => isBlockInFilter(filter, blockNumber)) ||
+                    transferFilters.some((filter) => isBlockInFilter(filter, blockNumber));
+                let traces = [];
+                if (shouldRequestTraces) {
+                    if (block === undefined) {
+                        [block, traces] = await Promise.all([
+                            eth_getBlockByNumber(args.rpc, [numberToHex(blockNumber), true], context),
+                            debug_traceBlockByNumber(args.rpc, [numberToHex(blockNumber), { tracer: "callTracer" }], context),
+                        ]);
+                    }
+                    else {
+                        traces = await debug_traceBlockByNumber(args.rpc, [numberToHex(blockNumber), { tracer: "callTracer" }], context);
+                    }
+                    traces = traces.filter((trace) => {
+                        let isMatched = false;
+                        for (const filter of transferFilters) {
+                            if (isTransferFilterMatched({
+                                filter,
+                                trace: trace.trace,
+                                block: { number: BigInt(blockNumber) },
+                            }) &&
+                                (isAddressFactory(filter.fromAddress)
+                                    ? isAddressMatched({
+                                        address: trace.trace.from,
+                                        blockNumber,
+                                        childAddresses: args.childAddresses.get(filter.fromAddress.id),
+                                    })
+                                    : true) &&
+                                (isAddressFactory(filter.toAddress)
+                                    ? isAddressMatched({
+                                        address: trace.trace.to,
+                                        blockNumber,
+                                        childAddresses: args.childAddresses.get(filter.toAddress.id),
+                                    })
+                                    : true)) {
+                                isMatched = true;
+                                requiredTransactions.add(trace.transactionHash);
+                                if (filter.hasTransactionReceipt) {
+                                    requiredTransactionReceipts.add(trace.transactionHash);
+                                    // skip to next trace
+                                    break;
+                                }
+                            }
+                        }
+                        for (const filter of traceFilters) {
+                            if (isTraceFilterMatched({
+                                filter,
+                                trace: trace.trace,
+                                block: { number: BigInt(blockNumber) },
+                            }) &&
+                                (isAddressFactory(filter.fromAddress)
+                                    ? isAddressMatched({
+                                        address: trace.trace.from,
+                                        blockNumber,
+                                        childAddresses: args.childAddresses.get(filter.fromAddress.id),
+                                    })
+                                    : true) &&
+                                (isAddressFactory(filter.toAddress)
+                                    ? isAddressMatched({
+                                        address: trace.trace.to,
+                                        blockNumber,
+                                        childAddresses: args.childAddresses.get(filter.toAddress.id),
+                                    })
+                                    : true)) {
+                                isMatched = true;
+                                requiredTransactions.add(trace.transactionHash);
+                                if (filter.hasTransactionReceipt) {
+                                    requiredTransactionReceipts.add(trace.transactionHash);
+                                    // skip to next trace
+                                    break;
+                                }
+                            }
+                        }
+                        return isMatched;
+                    });
+                    if (traces.length > 0) {
+                        validateTracesAndBlock(traces, block, {
+                            method: "debug_traceBlockByNumber",
+                            params: [toHex(blockNumber), { tracer: "callTracer" }],
+                        }, {
+                            method: "eth_getBlockByNumber",
+                            params: [toHex(blockNumber), true],
+                        });
+                    }
+                }
+                ////////
+                // Block
+                ////////
+                if (block === undefined &&
+                    blockFilters.some((filter) => isBlockFilterMatched({
+                        filter,
+                        block: { number: BigInt(blockNumber) },
+                    }))) {
+                    block = await eth_getBlockByNumber(args.rpc, [numberToHex(blockNumber), true], context);
+                }
+                ////////
+                // Transactions
+                ////////
+                // Return early if no data is fetched
+                if (block === undefined &&
+                    transactionFilters.some((filter) => isBlockInFilter(filter, blockNumber)) === false) {
+                    return;
+                }
+                if (block === undefined) {
+                    block = await eth_getBlockByNumber(args.rpc, [numberToHex(blockNumber), true], context);
+                }
+                if (closestToTipBlock === undefined ||
+                    hexToNumber(block.number) > hexToNumber(closestToTipBlock.number)) {
+                    closestToTipBlock = block;
+                }
+                const transactions = block.transactions.filter((transaction) => {
+                    let isMatched = requiredTransactions.has(transaction.hash);
+                    for (const filter of transactionFilters) {
+                        if (isTransactionFilterMatched({ filter, transaction }) &&
+                            (isAddressFactory(filter.fromAddress)
+                                ? isAddressMatched({
+                                    address: transaction.from,
+                                    blockNumber,
+                                    childAddresses: args.childAddresses.get(filter.fromAddress.id),
+                                })
+                                : true) &&
+                            (isAddressFactory(filter.toAddress)
+                                ? isAddressMatched({
+                                    address: transaction.to ?? undefined,
+                                    blockNumber,
+                                    childAddresses: args.childAddresses.get(filter.toAddress.id),
+                                })
+                                : true)) {
+                            requiredTransactionReceipts.add(transaction.hash);
+                            isMatched = true;
+                        }
+                    }
+                    return isMatched;
+                });
+                if (transactions.length > 0) {
+                    validateTransactionsAndBlock(block, {
+                        method: "eth_getBlockByNumber",
+                        params: [toHex(blockNumber), true],
+                    });
+                }
+                const transactionsByHash = new Map();
+                for (const transaction of transactions) {
+                    transactionsByHash.set(transaction.hash, transaction);
+                }
+                ////////
+                // Transaction Receipts
+                ////////
+                const transactionReceipts = await syncTransactionReceipts(block, requiredTransactionReceipts);
+                blockCount += 1;
+                transactionCount += transactions.length;
+                receiptCount += transactionReceipts.length;
+                traceCount += traces.length;
+                // Free memory of all unused transactions
+                block.transactions = transactions;
+                await promiseAllSettledWithThrow([
+                    syncStore.insertBlocks({ blocks: [block], chainId: args.chain.id }),
+                    syncStore.insertTransactions({
+                        transactions,
+                        chainId: args.chain.id,
+                    }),
+                    syncStore.insertTransactionReceipts({
+                        transactionReceipts,
+                        chainId: args.chain.id,
+                    }),
+                    syncStore.insertTraces({
+                        traces: traces.map((trace) => ({
+                            trace,
+                            block: block,
+                            transaction: transactionsByHash.get(trace.transactionHash),
+                        })),
+                        chainId: args.chain.id,
+                    }),
+                    syncStore.insertLogs({ logs, chainId: args.chain.id }),
+                ]);
+            };
+            let blockCount = 0;
+            let transactionCount = 0;
+            let receiptCount = 0;
+            let traceCount = 0;
+            // Same memory usage as `sync-realtime`.
+            const MAX_BLOCKS_IN_MEM = Math.max(args.chain.finalityBlockCount * 2, 100);
+            if (requiredIntervals.length > 0) {
+                const queue = createQueue({
+                    browser: false,
+                    initialStart: true,
+                    concurrency: MAX_BLOCKS_IN_MEM,
+                    worker: syncBlockData,
+                });
+                let firstError;
+                for (let blockNumber = interval[0]; blockNumber <= interval[1]; blockNumber++) {
+                    queue.add(blockNumber).catch((e) => {
+                        if (!firstError)
+                            firstError = e;
+                    });
+                }
+                await queue.onIdle();
+                if (firstError)
+                    throw firstError;
+            }
+            args.common.logger.debug({
+                msg: "Fetched block data",
+                chain: args.chain.name,
+                chain_id: args.chain.id,
+                block_range: JSON.stringify(interval),
+                block_count: blockCount,
+                transaction_count: transactionCount,
+                receipt_count: receiptCount,
+                trace_count: traceCount,
+                duration: endClock(),
+            }, ["chain", "block_range"]);
+            return closestToTipBlock;
+        },
+    };
+};
+//# sourceMappingURL=index.js.map
