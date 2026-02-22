@@ -412,6 +412,24 @@ export const getLogsRetryHelper = ({
     }
   }
 
+  // nodereal
+  match = sError.match(/logs count exceeds the limit (\d+)/);
+  if (match !== null) {
+    const currentRange =
+      hexToBigInt(params[0].toBlock) - hexToBigInt(params[0].fromBlock);
+    const ranges = chunk({
+      params,
+      range: currentRange / 2n,
+    });
+    if (isRangeUnchanged(params, ranges) === false) {
+      return {
+        shouldRetry: true,
+        ranges,
+        isSuggestedRange: false,
+      };
+    }
+  }
+
   // catch-all
   if (
     // valtitude

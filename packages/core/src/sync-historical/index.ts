@@ -114,12 +114,9 @@ export const createHistoricalSync = (
     confirmedRange?: number;
     /** Track consecutive successes for step-function growth */
     successCount: number;
-    /** Whether truncation was ever detected — limits range growth */
-    truncationDetected: boolean;
   } = {
     estimatedRange: 2_000,
     successCount: 0,
-    truncationDetected: false,
   };
 
   const TRUNCATION_THRESHOLD = 2_000;
@@ -221,13 +218,22 @@ export const createHistoricalSync = (
                 const lastLogBlock = hexToNumber(
                   chunkLogs[chunkLogs.length - 1]!.blockNumber,
                 );
-                if (lastLogBlock < interval[1]) {
-                  logsRequestMetadata.truncationDetected = true;
+                const coveredRange = lastLogBlock - interval[0] + 1;
+                const logsPerBlock =
+                  coveredRange > 0
+                    ? chunkLogs.length / coveredRange
+                    : 0;
+                const uncoveredBlocks = interval[1] - lastLogBlock;
+                const expectedMissing = logsPerBlock * uncoveredBlocks;
+
+                if (
+                  lastLogBlock < interval[1] &&
+                  expectedMissing > 10
+                ) {
                   logsRequestMetadata.estimatedRange = Math.max(
                     25,
                     lastLogBlock - interval[0],
                   );
-                  logsRequestMetadata.successCount = 0;
 
                   args.common.logger.warn({
                     msg: "eth_getLogs truncation detected, retrying remaining range",
@@ -236,6 +242,7 @@ export const createHistoricalSync = (
                     requested_range: `${interval[0]}-${interval[1]}`,
                     last_log_block: lastLogBlock,
                     log_count: chunkLogs.length,
+                    expected_missing: Math.round(expectedMissing),
                   });
 
                   args.common.metrics.ponder_sync_truncation_total.inc({
@@ -295,7 +302,6 @@ export const createHistoricalSync = (
                   ? range
                   : undefined,
                 successCount: 0,
-                truncationDetected: logsRequestMetadata.truncationDetected,
               };
 
               return syncLogsDynamic(
@@ -323,9 +329,8 @@ export const createHistoricalSync = (
     if (logsRequestMetadata.confirmedRange === undefined) {
       logsRequestMetadata.successCount++;
 
-      const multiplier = logsRequestMetadata.truncationDetected
-        ? 1.05
-        : logsRequestMetadata.successCount <= 3
+      const multiplier =
+        logsRequestMetadata.successCount <= 3
           ? 2
           : logsRequestMetadata.successCount <= 8
             ? 1.5
