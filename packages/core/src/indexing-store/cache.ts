@@ -715,7 +715,7 @@ export const createIndexingCache = ({
 
               addErrorMeta(
                 error,
-                `db.insert arguments:\n${prettyPrint(result.value.row)}`,
+                `db.insert arguments:\n${prettyPrint(result.value.row, { truncate: false })}`,
               );
 
               if (result.value.metadata.event) {
@@ -787,7 +787,7 @@ export const createIndexingCache = ({
 
               addErrorMeta(
                 error,
-                `db.update arguments:\n${prettyPrint(result.value.row)}`,
+                `db.update arguments:\n${prettyPrint(result.value.row, { truncate: false })}`,
               );
 
               if (result.value.metadata.event) {
